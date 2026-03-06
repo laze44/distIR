@@ -13,6 +13,28 @@ from mercury.ir.utils import collect_reduce, get_inner_buffer
 from .nodes import GridLoop, BufferLoad, BufferStore, IRNode, Program, ReduceOp, RingComm
 from .elements import Axis, Buffer
 
+def _mesh_dim_conflict(buffer: Buffer, target_dim: int, dim_list: List[int]) -> bool:
+    """Check whether target mesh dims are already used by other tensor dims."""
+    for spec_dim, spec in enumerate(buffer.shard_spec.specs):
+        if spec_dim == target_dim:
+            continue
+        if spec == ShardType.REPLICATE:
+            continue
+        _, mesh_dims = spec
+        if set(mesh_dims).intersection(dim_list):
+            return True
+    return False
+
+def _can_cut_buffer(buffer: Buffer, axis: Axis, start_dim: int, end_dim: int) -> bool:
+    """Return whether `cut_buffer` can shard `axis` on the mesh dim range."""
+    if not buffer.has_axis(axis):
+        return False
+    if buffer.shard_spec is None:
+        raise ValueError(f"Buffer {buffer.tensor} has no shard_spec. Call init_distributed first.")
+    dim_id, _ = buffer.get_axis(axis)
+    dim_list = list(range(start_dim, end_dim))
+    return not _mesh_dim_conflict(buffer, dim_id, dim_list)
+
 def identify_buffer_commands(ir: IRNode):
     """collect the commands related to the buffer in the axis"""
     def collect_buffers(node):
@@ -67,6 +89,17 @@ def shift(program: Program, axis: Axis, mesh: DeviceMesh, start_dim: int, end_di
             continue
         
         num_cards = mesh.shape[start_dim]
+        # Skip this inner axis if any related buffer would reuse a mesh dim on
+        # another tensor dimension (which violates ShardingSpec invariants).
+        related_buffers = {}
+        for command in all_buffer_commands:
+            if command.buffer.tensor not in related_buffers and command.buffer.has_axis(inner_axis):
+                related_buffers[command.buffer.tensor] = command.buffer
+        if any(
+            not _can_cut_buffer(buffer, inner_axis, start_dim, start_dim + 1)
+            for buffer in related_buffers.values()
+        ):
+            continue
 
         divided = set()
 
@@ -139,16 +172,22 @@ def cut_buffer(buffer: Buffer, axis: Axis, start_dim: int, end_dim: int, num_car
     cut the buffer in the axis
     """
     if buffer.has_axis(axis):
+        if buffer.shard_spec is None:
+            raise ValueError(f"Buffer {buffer.tensor} has no shard_spec. Call init_distributed first.")
         dim_id, _ = buffer.get_axis(axis)
+        dim_list = list(range(start_dim, end_dim))
+        if _mesh_dim_conflict(buffer, dim_id, dim_list):
+            raise ValueError(
+                f"Buffer {buffer.tensor} cannot shard axis {axis.name} on mesh dims {dim_list} "
+                "because those mesh dims are already used by another tensor dimension."
+            )
         if isinstance(buffer.shape[dim_id], int): # dynamic shape doesn't need to be cut, as it will be cut along with the axis
             buffer.shape[dim_id] = int(buffer.shape[dim_id] // num_cards)
-        dim_list = list(range(start_dim, end_dim))
         if buffer.shard_spec.specs[dim_id] == ShardType.REPLICATE:
             buffer.shard_spec.specs[dim_id] = (ShardType.SHARD, dim_list)
         else:
             old_shard_dim = buffer.shard_spec.specs[dim_id][1]
-            old_shard_dim.extend(dim_list)
-            new_shard_dim = list(set(old_shard_dim))
+            new_shard_dim = sorted(set(old_shard_dim + dim_list))
             buffer.shard_spec.specs[dim_id] = (ShardType.SHARD, new_shard_dim)
         buffer.shard_spec.validate()
     else:
