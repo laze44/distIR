@@ -12,6 +12,9 @@ from mercury.ir.utils import collect_axis, collect_loops, collect_parallelizeabl
 from typing import List, Iterator, Tuple
 
 
+MAX_AXIS_TILE_FACTOR = 16
+
+
 def enumerate_mesh_shapes(mesh_size: int, max_dim: int, current_shape: List[int] = None, remaining: int = None) -> Iterator[Tuple[int, ...]]:
     """
     enumerate all possible device mesh shapes.
@@ -104,17 +107,21 @@ def enumerate_mesh_assignment(ndim: int, axes_num: int) -> Iterator[List[Tuple[i
     yield from _recursive_assign(list(range(ndim)), 0, [])
 
 def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int]) -> Iterator[List[int]]:
-    """ enumarate all possible axis split for a given axis number and resource cards """
+    """Enumerate all valid split factors for target axes.
+
+    The split candidates are independent from ``res_cards`` and are constrained by:
+    1) exact divisibility, 2) minimum block size, and 3) a maximum tile-factor cap.
+    """
     if len(cur_split) == len(axes):
         yield copy.deepcopy(cur_split)
         return
     
     cur_axis = axes[len(cur_split)]
-    
-    for i in range(1, res_cards + 1):
-        if cur_axis.size % i == 0 and cur_axis.size // i >= cur_axis.min_block_size \
-        and res_cards % i == 0:
-            yield from enumerate_axis_split(axes, res_cards // i, cur_split + [i])
+
+    max_split_factor = min(MAX_AXIS_TILE_FACTOR, cur_axis.size)
+    for factor in range(1, max_split_factor + 1):
+        if cur_axis.size % factor == 0 and cur_axis.size // factor >= cur_axis.min_block_size:
+            yield from enumerate_axis_split(axes, res_cards, cur_split + [factor])
 
 
 # def detect_conflict_axis(assign, axes_list, mutex_pair) -> bool:
