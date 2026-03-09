@@ -7,14 +7,15 @@ import argparse
 import ast
 import contextlib
 import io
-import json
 import os
 import textwrap
+from typing import Any, Dict, List, Tuple
 
 from mercury.backend import generate_pytorch_code
 from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
+from mercury.ir.utils import get_io_buffers
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.search import search
@@ -52,6 +53,107 @@ def _capture_dump(program) -> str:
     with contextlib.redirect_stdout(buf):
         dump(program)
     return buf.getvalue()
+
+
+def _product(values: Tuple[int, ...]) -> int:
+    """Compute product of integer tuple values."""
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _n_dim_to_one_dim(n_dim_index: Tuple[int, ...], dimensions: Tuple[int, ...]) -> int:
+    """Convert an N-D index into a flattened index using row-major order."""
+    one_dim_index = 0
+    for index, dim_size in zip(reversed(n_dim_index), reversed(dimensions)):
+        one_dim_index = one_dim_index * int(dim_size) + int(index)
+    return one_dim_index
+
+
+def _extract_abc_device_mapping(program) -> Dict[str, Any]:
+    """Extract A/B/C mapping info on each device for one IR program."""
+    if program.mesh is None:
+        return {}
+
+    buffers = program.visit(get_io_buffers)
+    abc_buffers: Dict[str, Any] = {}
+    for buffer in buffers:
+        if buffer.tensor in ("a", "b", "c") and buffer.tensor not in abc_buffers:
+            abc_buffers[buffer.tensor] = buffer
+
+    if len(abc_buffers) == 0:
+        return {}
+
+    mesh = program.mesh
+    device_coords = {int(mesh.get_device(coords)): tuple(int(v) for v in coords) for coords in mesh.all_coords()}
+
+    tensor_mapping: Dict[str, Any] = {}
+    for tensor_name in ("a", "b", "c"):
+        buffer = abc_buffers.get(tensor_name)
+        if buffer is None or buffer.shard_spec is None:
+            continue
+
+        local_shape = [int(dim_size) for dim_size in buffer.get_shape()]
+        per_device = {}
+        for device_id in sorted(int(dev) for dev in mesh.devices):
+            coords = device_coords[device_id]
+            dim_mappings: List[Dict[str, Any]] = []
+            for dim, spec in enumerate(buffer.shard_spec.specs):
+                local_size = local_shape[dim]
+                if isinstance(spec, tuple):
+                    _, mesh_dims = spec
+                    mesh_dims_tuple = tuple(int(v) for v in mesh_dims)
+                    shard_coord = tuple(coords[i] for i in mesh_dims_tuple)
+                    shard_mesh = tuple(int(mesh.shape[i]) for i in mesh_dims_tuple)
+                    shard_index = _n_dim_to_one_dim(shard_coord, shard_mesh)
+                    num_shards = _product(shard_mesh)
+                    start = shard_index * local_size
+                    end = start + local_size
+                    dim_mappings.append(
+                        {
+                            "dim": dim,
+                            "local_size": local_size,
+                            "global_range": [start, end],
+                            "sharding": "S",
+                            "mesh_dims": list(mesh_dims_tuple),
+                            "shard_index": shard_index,
+                            "num_shards": num_shards,
+                        }
+                    )
+                else:
+                    dim_mappings.append(
+                        {
+                            "dim": dim,
+                            "local_size": local_size,
+                            "global_range": [0, local_size],
+                            "sharding": "R",
+                            "mesh_dims": [],
+                            "shard_index": 0,
+                            "num_shards": 1,
+                        }
+                    )
+
+            per_device[str(device_id)] = {
+                "mesh_coord": list(coords),
+                "dim_mappings": dim_mappings,
+            }
+
+        serialized_shard_spec = []
+        for spec in buffer.shard_spec.specs:
+            if isinstance(spec, tuple):
+                _, mesh_dims = spec
+                serialized_shard_spec.append(["S", [int(v) for v in mesh_dims]])
+            else:
+                serialized_shard_spec.append("R")
+
+        tensor_mapping[tensor_name.upper()] = {
+            "shape": local_shape,
+            "shard_spec": serialized_shard_spec,
+            "per_device": per_device,
+        }
+
+    return tensor_mapping
 
 
 def search_gemm(
@@ -127,30 +229,31 @@ def search_gemm(
             f"GEMM Search Results: M={m}, N={n}, K={k}, "
             f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
         ),
+        f"Requested top_k: {top_k}",
         f"Total programs searched: {len(searched_programs)}",
         f"Top-k saved: {save_count}",
         f"Hardware config: {hw_config['name']}",
         "",
     ]
 
-    summary_json = {
-        "config": {
-            "m": m,
-            "n": n,
-            "k": k,
-            "inter_node": inter_node,
-            "intra_node": intra_node,
-            "world_size": world_size,
-            "hardware": hw_config["name"],
-            "top_k": top_k,
-        },
-        "total_searched": len(searched_programs),
-        "programs": [],
-    }
+    summary_lines.extend([
+        "Summary Metadata (migrated from summary.json):",
+        f"  config.m={m}",
+        f"  config.n={n}",
+        f"  config.k={k}",
+        f"  config.inter_node={inter_node}",
+        f"  config.intra_node={intra_node}",
+        f"  config.world_size={world_size}",
+        f"  config.hardware={hw_config['name']}",
+        f"  config.top_k={top_k}",
+        f"  total_searched={len(searched_programs)}",
+        "",
+    ])
 
     for idx, (res_program, estimate) in enumerate(selected_programs):
         code = generate_pytorch_code(res_program)
         ir_text = _capture_dump(res_program)
+        tensor_device_mapping = _extract_abc_device_mapping(res_program)
 
         code_filename = f"program_{idx + 1}_code.py"
         ir_filename = f"program_{idx + 1}_ir.txt"
@@ -163,27 +266,39 @@ def search_gemm(
         summary_lines.append(f"Program {idx + 1} (Rank {idx + 1}):")
         summary_lines.append(f"  Code: {code_filename}")
         summary_lines.append(f"  IR:   {ir_filename}")
+        summary_lines.append(f"  JSON rank field: {idx + 1}")
         summary_lines.append(f"  Estimated compute time: {estimate.compute_time_ms:.6f} ms")
         summary_lines.append(f"  Estimated communication time: {estimate.comm_time_ms:.6f} ms")
         summary_lines.append(f"  Estimated total time: {estimate.total_time_ms:.6f} ms")
+        if len(tensor_device_mapping) > 0:
+            summary_lines.append("  Tensor Mapping (A/B/C on each device):")
+            for tensor_name in ("A", "B", "C"):
+                tensor_info = tensor_device_mapping.get(tensor_name)
+                if tensor_info is None:
+                    continue
+                summary_lines.append(f"    {tensor_name}:")
+                for device_id, device_info in tensor_info["per_device"].items():
+                    dim_segments = []
+                    for dim_info in device_info["dim_mappings"]:
+                        seg = (
+                            f"d{dim_info['dim']}=[{dim_info['global_range'][0]},{dim_info['global_range'][1]})"
+                            f"/{dim_info['sharding']}"
+                        )
+                        if dim_info["sharding"] == "S":
+                            seg += (
+                                f"(mesh_dims={dim_info['mesh_dims']},"
+                                f" shard={dim_info['shard_index']}/{dim_info['num_shards']})"
+                            )
+                        dim_segments.append(seg)
+                    summary_lines.append(
+                        f"      device {device_id}, mesh_coord={device_info['mesh_coord']}: "
+                        + "; ".join(dim_segments)
+                    )
         summary_lines.append("")
-
-        summary_json["programs"].append({
-            "rank": idx + 1,
-            "code_file": code_filename,
-            "ir_file": ir_filename,
-            "compute_time_ms": estimate.compute_time_ms,
-            "comm_time_ms": estimate.comm_time_ms,
-            "total_time_ms": estimate.total_time_ms,
-        })
 
     summary_path = os.path.join(result_dir, "summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
-
-    summary_json_path = os.path.join(result_dir, "summary.json")
-    with open(summary_json_path, "w", encoding="utf-8") as f:
-        json.dump(summary_json, f, indent=2)
 
     print(
         f"Found {len(searched_programs)} program(s) for GEMM {m}x{n}x{k} "
@@ -193,7 +308,6 @@ def search_gemm(
     print(f"Saved top-{save_count} program(s) ranked by estimated total time")
     print(f"Results saved to: {result_dir}/")
     print(f"Summary: {summary_path}")
-    print(f"Summary JSON: {summary_json_path}")
 
 
 def main() -> None:

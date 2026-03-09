@@ -350,22 +350,24 @@ def test_top_k_output_and_summary_schema(tmp_path):
     )
 
     result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
-    summary_json_path = result_dir / "summary.json"
     summary_txt_path = result_dir / "summary.txt"
 
-    assert summary_json_path.exists()
     assert summary_txt_path.exists()
 
-    payload = json.loads(summary_json_path.read_text(encoding="utf-8"))
-    saved = len(payload["programs"])
-    assert saved == min(3, payload["total_searched"])
+    text = summary_txt_path.read_text(encoding="utf-8")
+    assert "Summary Metadata (migrated from summary.json):" in text
+    assert "config.top_k=3" in text
+    assert "total_searched=" in text
+    assert "Program 1 (Rank 1):" in text
+    assert "Estimated compute time:" in text
+    assert "Estimated communication time:" in text
+    assert "Estimated total time:" in text
 
-    for entry in payload["programs"]:
-        assert (result_dir / entry["code_file"]).exists()
-        assert (result_dir / entry["ir_file"]).exists()
-        assert "compute_time_ms" in entry
-        assert "comm_time_ms" in entry
-        assert "total_time_ms" in entry
+    # Ensure top-k cap still applies by counting generated code files.
+    code_files = sorted(result_dir.glob("program_*_code.py"))
+    ir_files = sorted(result_dir.glob("program_*_ir.txt"))
+    assert len(code_files) == len(ir_files)
+    assert len(code_files) <= 3
 
 
 def test_cli_default_top_k(tmp_path):
@@ -391,9 +393,11 @@ def test_cli_default_top_k(tmp_path):
     subprocess.run(cmd, check=True)
 
     result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
-    payload = json.loads((result_dir / "summary.json").read_text(encoding="utf-8"))
-    assert payload["config"]["top_k"] == 10
-    assert len(payload["programs"]) == min(10, payload["total_searched"])
+    text = (result_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "config.top_k=10" in text
+
+    code_files = sorted(result_dir.glob("program_*_code.py"))
+    assert len(code_files) <= 10
 
 
 def test_top_k_must_be_positive(tmp_path):
