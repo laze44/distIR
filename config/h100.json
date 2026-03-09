@@ -1,0 +1,25 @@
+{
+  "name": "H100-SXM",
+  "compute": {
+    "peak_tflops": {
+      "bf16": 989.0,
+      "fp16": 989.0,
+      "fp32": 495.0,
+      "tf32": 495.0
+    }
+  },
+  "memory": {
+    "bandwidth_tb_per_s": 3.35,
+    "capacity_gb": 80.0
+  },
+  "interconnect": {
+    "intra_node": {
+      "bandwidth_gb_per_s": 900.0,
+      "latency_us": 3.0
+    },
+    "inter_node": {
+      "bandwidth_gb_per_s": 400.0,
+      "latency_us": 5.0
+    }
+  }
+}

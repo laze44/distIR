@@ -7,6 +7,7 @@ import argparse
 import ast
 import contextlib
 import io
+import json
 import os
 import textwrap
 
@@ -15,6 +16,7 @@ from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
 from mercury.search.dump import dump
+from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.search import search
 
 
@@ -59,6 +61,8 @@ def search_gemm(
     inter_node: int,
     intra_node: int,
     output_dir: str,
+    top_k: int,
+    hw_config_path: str,
 ) -> None:
     """Search all tiling/parallelism configurations and save results.
 
@@ -69,9 +73,13 @@ def search_gemm(
         inter_node: Number of inter-node partitions in the mesh.
         intra_node: Number of intra-node partitions in the mesh.
         output_dir: Directory to write result files into.
+        top_k: Number of best estimated programs to persist.
+        hw_config_path: Path to hardware configuration JSON file.
     """
     if inter_node <= 0 or intra_node <= 0:
         raise ValueError("inter_node and intra_node must be positive integers")
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
 
     world_size = inter_node * intra_node
 
@@ -95,6 +103,24 @@ def search_gemm(
     # Sort for deterministic ordering (same approach as test_search_gemm.py)
     searched_programs.sort(key=lambda x: generate_pytorch_code(x))
 
+    hw_config = load_hardware_config(hw_config_path)
+
+    estimated_programs = []
+    num_inter_dims = 1 if inter_node > 1 else 0
+    for res_program in searched_programs:
+        eliminate_loops(res_program)
+        estimate = estimate_program(
+            res_program,
+            hw_config,
+            num_inter_dims=num_inter_dims,
+        )
+        estimated_programs.append((res_program, estimate))
+
+    estimated_programs.sort(key=lambda item: item[1].total_time_ms)
+
+    save_count = min(top_k, len(estimated_programs))
+    selected_programs = estimated_programs[:save_count]
+
     result_dir = os.path.join(
         output_dir,
         f"gemm_{m}x{n}x{k}_inter{inter_node}_intra{intra_node}",
@@ -106,12 +132,28 @@ def search_gemm(
             f"GEMM Search Results: M={m}, N={n}, K={k}, "
             f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
         ),
-        f"Total programs found: {len(searched_programs)}",
+        f"Total programs searched: {len(searched_programs)}",
+        f"Top-k saved: {save_count}",
+        f"Hardware config: {hw_config['name']}",
         "",
     ]
 
-    for idx, res_program in enumerate(searched_programs):
-        eliminate_loops(res_program)
+    summary_json = {
+        "config": {
+            "m": m,
+            "n": n,
+            "k": k,
+            "inter_node": inter_node,
+            "intra_node": intra_node,
+            "world_size": world_size,
+            "hardware": hw_config["name"],
+            "top_k": top_k,
+        },
+        "total_searched": len(searched_programs),
+        "programs": [],
+    }
+
+    for idx, (res_program, estimate) in enumerate(selected_programs):
         code = generate_pytorch_code(res_program)
         ir_text = _capture_dump(res_program)
 
@@ -123,22 +165,40 @@ def search_gemm(
         with open(os.path.join(result_dir, ir_filename), "w", encoding="utf-8") as f:
             f.write(ir_text)
 
-        summary_lines.append(f"Program {idx + 1}:")
+        summary_lines.append(f"Program {idx + 1} (Rank {idx + 1}):")
         summary_lines.append(f"  Code: {code_filename}")
         summary_lines.append(f"  IR:   {ir_filename}")
+        summary_lines.append(f"  Estimated compute time: {estimate.compute_time_ms:.6f} ms")
+        summary_lines.append(f"  Estimated communication time: {estimate.comm_time_ms:.6f} ms")
+        summary_lines.append(f"  Estimated total time: {estimate.total_time_ms:.6f} ms")
         summary_lines.append("")
+
+        summary_json["programs"].append({
+            "rank": idx + 1,
+            "code_file": code_filename,
+            "ir_file": ir_filename,
+            "compute_time_ms": estimate.compute_time_ms,
+            "comm_time_ms": estimate.comm_time_ms,
+            "total_time_ms": estimate.total_time_ms,
+        })
 
     summary_path = os.path.join(result_dir, "summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
+
+    summary_json_path = os.path.join(result_dir, "summary.json")
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary_json, f, indent=2)
 
     print(
         f"Found {len(searched_programs)} program(s) for GEMM {m}x{n}x{k} "
         f"with inter_node={inter_node}, intra_node={intra_node} "
         f"(world_size={world_size})"
     )
+    print(f"Saved top-{save_count} program(s) ranked by estimated total time")
     print(f"Results saved to: {result_dir}/")
     print(f"Summary: {summary_path}")
+    print(f"Summary JSON: {summary_json_path}")
 
 
 def main() -> None:
@@ -166,6 +226,18 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", type=str, default="results",
                         help="Output directory for results (default: results)")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Number of best estimated programs to save (default: 10)",
+    )
+    parser.add_argument(
+        "--hw-config",
+        type=str,
+        default="config/h100.json",
+        help="Hardware configuration JSON path (default: config/h100.json)",
+    )
     args = parser.parse_args()
     search_gemm(
         args.m,
@@ -174,6 +246,8 @@ def main() -> None:
         args.inter_node,
         args.intra_node,
         args.output_dir,
+        args.top_k,
+        args.hw_config,
     )
 
 

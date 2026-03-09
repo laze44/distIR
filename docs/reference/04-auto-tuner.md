@@ -51,3 +51,22 @@ Auto-tuner 的优化目标是：
 ## 结果特征（本节结尾）
 
 论文在该节末给出经验结果：按上述规则，评测中单算子调优可在约 10 分钟内完成；同时也指出更复杂算子/拓扑下仍有进一步引入 cost model 或 ML predictor 的空间。
+
+## Roofline Hardware Config Schema
+
+理论性能估算使用 `config/*.json` 中的硬件参数，不再依赖运行时 profile。默认配置文件为
+`config/h100.json`，字段要求如下：
+
+- `name`: 非空字符串
+- `compute.peak_tflops.bf16`: 正数
+- `compute.peak_tflops.fp16`: 正数
+- `compute.peak_tflops.fp32`: 正数
+- `compute.peak_tflops.tf32`: 可选，若提供则必须为正数
+- `memory.bandwidth_tb_per_s`: 正数
+- `memory.capacity_gb`: 可选，若提供则必须为正数
+- `interconnect.intra_node.bandwidth_gb_per_s`: 正数
+- `interconnect.intra_node.latency_us`: 非负数
+- `interconnect.inter_node.bandwidth_gb_per_s`: 正数
+- `interconnect.inter_node.latency_us`: 非负数
+
+通信估算会根据 mesh 维度和 `num_inter_dims` 自动选择 intra-node/inter-node 的带宽与延迟参数。

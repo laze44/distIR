@@ -112,6 +112,19 @@ This project is licensed under the MIT License. Please see the [`LICENSE`](LICEN
 
 # 8. Other Q&A
 
+# 9. Theoretical Estimation Workflow
+
+For CPU-only environments, you can rank GEMM search candidates with theoretical estimation
+instead of GPU profiling. The estimator uses a roofline compute model and communication
+cost formulas parameterized by `config/h100.json`.
+
+```shell
+python example_gemm_ir.py --m 512 --n 1024 --k 1024 --inter-node 1 --intra-node 2 --top-k 10
+```
+
+The command saves only the top-k estimated candidates and writes both `summary.txt` and
+`summary.json` in the results folder.
+
 ## Docker hub login
 
 Since we are using a base docker image provided by Nvidia, you need to sign in to the Nvidia docker hub before building the image.

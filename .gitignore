@@ -14,3 +14,5 @@ dist/
 Thumbs.db
 *.tmp
 *.swp
+*.log
+.env*
