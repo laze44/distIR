@@ -106,14 +106,9 @@ def search_gemm(
     hw_config = load_hardware_config(hw_config_path)
 
     estimated_programs = []
-    num_inter_dims = 1 if inter_node > 1 else 0
     for res_program in searched_programs:
         eliminate_loops(res_program)
-        estimate = estimate_program(
-            res_program,
-            hw_config,
-            num_inter_dims=num_inter_dims,
-        )
+        estimate = estimate_program(res_program, hw_config)
         estimated_programs.append((res_program, estimate))
 
     estimated_programs.sort(key=lambda item: item[1].total_time_ms)

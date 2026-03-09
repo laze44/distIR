@@ -4,12 +4,11 @@
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
-from mercury.ir.calculate_memory import get_buffer_size
-from mercury.ir.elements import Axis, Buffer
+from mercury.ir.elements import Buffer
 from mercury.ir.nodes import BufferLoad, BufferStore, Program, ReduceOp
 from mercury.ir.utils import collect_axis, collect_reduce, get_element_size
 
@@ -32,9 +31,17 @@ class EstimateResult:
     def __post_init__(self) -> None:
         if self.compute_time_ms < 0 or self.comm_time_ms < 0 or self.total_time_ms < 0:
             raise ValueError("Estimated times must be non-negative")
-        expected_total = self.compute_time_ms + self.comm_time_ms
-        if abs(self.total_time_ms - expected_total) > 1e-9:
-            raise ValueError("total_time_ms must equal compute_time_ms + comm_time_ms")
+        if self.total_time_ms - (self.compute_time_ms + self.comm_time_ms) > 1e-9:
+            raise ValueError("total_time_ms cannot exceed compute_time_ms + comm_time_ms")
+
+
+@dataclass
+class _CommEvent:
+    """One communication event used by overlap estimation."""
+
+    time_ms: float
+    buffer_name: str
+    overlaps_compute: bool
 
 
 def _get_required(config: Dict[str, Any], path: Sequence[str]) -> Any:
@@ -106,9 +113,22 @@ def _buffer_numel(buffer: Buffer) -> int:
     return numel
 
 
+def _collect_unique_buffers(program: Program) -> List[Buffer]:
+    seen: Dict[str, Buffer] = {}
+
+    def _collector(node: Any) -> Optional[Buffer]:
+        if hasattr(node, "buffer") and isinstance(node.buffer, Buffer):
+            return node.buffer
+        return None
+
+    for buffer in program.visit(_collector):
+        if buffer.tensor not in seen:
+            seen[buffer.tensor] = buffer
+    return list(seen.values())
+
+
 def _first_output_buffer(program: Program) -> Optional[Buffer]:
-    buffers = program.visit(lambda node: node.buffer if hasattr(node, "buffer") and isinstance(node.buffer, Buffer) else None)
-    for buffer in buffers:
+    for buffer in _collect_unique_buffers(program):
         if buffer.write:
             return buffer
     return None
@@ -158,6 +178,32 @@ def _memory_bandwidth_bytes_per_second(hw_config: Dict[str, Any]) -> float:
     return bandwidth_tb_per_s * (10 ** 12)
 
 
+def _estimate_gemm_data_bytes(program: Program) -> float:
+    """Estimate single-execution memory traffic for local GEMM."""
+    output_buffer = _first_output_buffer(program)
+    if output_buffer is None:
+        raise ValueError("Program has no writable output buffer")
+
+    output_bytes = float(_buffer_numel(output_buffer) * get_element_size(output_buffer.dtype))
+    buffers = _collect_unique_buffers(program)
+
+    read_buffers = [buffer for buffer in buffers if buffer.tensor != output_buffer.tensor and buffer.read]
+    if len(read_buffers) < 2:
+        fallback_buffers = [buffer for buffer in buffers if buffer.tensor != output_buffer.tensor]
+        fallback_buffers.sort(key=_buffer_numel, reverse=True)
+        read_buffers = fallback_buffers[:2]
+    else:
+        read_buffers.sort(key=_buffer_numel, reverse=True)
+        read_buffers = read_buffers[:2]
+
+    read_bytes = 0.0
+    for buffer in read_buffers:
+        read_bytes += float(_buffer_numel(buffer) * get_element_size(buffer.dtype))
+
+    # C local is read and written at least once in GEMM accumulation.
+    return read_bytes + 2.0 * output_bytes
+
+
 def _estimate_compute_time_ms(program: Program, hw_config: Dict[str, Any]) -> float:
     m_local, n_local, k_local = _extract_local_mnk(program)
     flops = 2.0 * float(m_local) * float(n_local) * float(k_local)
@@ -167,8 +213,8 @@ def _estimate_compute_time_ms(program: Program, hw_config: Dict[str, Any]) -> fl
         raise ValueError("Program has no writable output buffer")
 
     compute_bound_s = flops / _peak_flops_per_second(hw_config, output_buffer.dtype)
-    memory_bytes = float(get_buffer_size(program))
-    memory_bound_s = memory_bytes / _memory_bandwidth_bytes_per_second(hw_config)
+    bytes_moved = _estimate_gemm_data_bytes(program)
+    memory_bound_s = bytes_moved / _memory_bandwidth_bytes_per_second(hw_config)
     return max(compute_bound_s, memory_bound_s) * 1000.0
 
 
@@ -185,71 +231,164 @@ def _collect_comm_nodes(program: Program) -> List[Any]:
     return program.visit(_collector)
 
 
-def _link_params(hw_config: Dict[str, Any], inter_node: bool) -> List[float]:
+def _normalize_mesh_dims(mesh_dims: List[int], ndim: int) -> List[int]:
+    unique = sorted(set(int(dim) for dim in mesh_dims))
+    return [dim for dim in unique if 0 <= dim < ndim]
+
+
+def _normalize_topology_metadata(
+    program: Program,
+    num_inter_dims: Optional[int],
+) -> Dict[str, List[int]]:
+    ndim = len(program.mesh.shape)
+    metadata = dict(program.topology_metadata) if program.topology_metadata is not None else {}
+
+    if "inter_node_dims" not in metadata:
+        if num_inter_dims is None:
+            inter_node_dims = [0] if ndim > 1 else []
+        else:
+            inter_node_dims = list(range(max(0, min(ndim, num_inter_dims))))
+        metadata["inter_node_dims"] = inter_node_dims
+
+    inter_node_dims = _normalize_mesh_dims(metadata.get("inter_node_dims", []), ndim)
+    intra_node_dims = _normalize_mesh_dims(metadata.get("intra_node_dims", []), ndim)
+    mixed_dims = _normalize_mesh_dims(metadata.get("mixed_dims", []), ndim)
+
+    covered = set(inter_node_dims) | set(intra_node_dims) | set(mixed_dims)
+    for dim in range(ndim):
+        if dim not in covered:
+            intra_node_dims.append(dim)
+
+    return {
+        "inter_node_dims": sorted(set(inter_node_dims)),
+        "intra_node_dims": sorted(set(intra_node_dims)),
+        "mixed_dims": sorted(set(mixed_dims)),
+    }
+
+
+def _link_params(hw_config: Dict[str, Any], inter_node: bool) -> Tuple[float, float]:
     if inter_node:
         bandwidth = _read_positive(hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]) * (10 ** 9)
         latency_s = _read_non_negative(hw_config, ["interconnect", "inter_node", "latency_us"]) / (10 ** 6)
     else:
         bandwidth = _read_positive(hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]) * (10 ** 9)
         latency_s = _read_non_negative(hw_config, ["interconnect", "intra_node", "latency_us"]) / (10 ** 6)
-    return [bandwidth, latency_s]
+    return bandwidth, latency_s
 
 
-def _estimate_reduce_comm_ms(program: Program, hw_config: Dict[str, Any], num_inter_dims: int) -> float:
-    comm_s = 0.0
+def _is_inter_mesh_dim(mesh_dim: int, topology_metadata: Dict[str, List[int]]) -> bool:
+    if mesh_dim in topology_metadata["inter_node_dims"]:
+        return True
+    if mesh_dim in topology_metadata["intra_node_dims"]:
+        return False
+    if mesh_dim in topology_metadata["mixed_dims"]:
+        return True
+    return True
+
+
+def _estimate_collective_reduce_events(
+    program: Program,
+    hw_config: Dict[str, Any],
+    topology_metadata: Dict[str, List[int]],
+) -> List[_CommEvent]:
+    events: List[_CommEvent] = []
     reduce_ops = program.visit(collect_reduce)
 
     for reduce_op in reduce_ops:
         if len(reduce_op.shard_dim) == 0:
             continue
 
+        ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
+        shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
+        shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
+        if len(shard_dims) == 0:
+            continue
+
+        participants = 1
+        for mesh_dim in shard_dims:
+            participants *= int(program.mesh.shape[mesh_dim])
+        if participants <= 1:
+            continue
+
         data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
-        for mesh_dim in reduce_op.shard_dim:
-            if mesh_dim >= len(program.mesh.shape):
-                continue
-            participants = int(program.mesh.shape[mesh_dim])
-            if participants <= 1:
-                continue
-            inter_node = mesh_dim < num_inter_dims
-            bandwidth, latency_s = _link_params(hw_config, inter_node)
-            comm_s += latency_s + (2.0 * (participants - 1.0) / participants) * (data_bytes / bandwidth)
+        inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
+        bandwidth, latency_s = _link_params(hw_config, inter_node)
 
-    return comm_s * 1000.0
+        rounds = 2.0 * (participants - 1.0)
+        transfer_factor = 2.0 * (participants - 1.0) / participants
+        comm_s = rounds * latency_s + transfer_factor * (data_bytes / bandwidth)
+        events.append(
+            _CommEvent(
+                time_ms=comm_s * 1000.0,
+                buffer_name=reduce_op.buffer.tensor,
+                overlaps_compute=False,
+            )
+        )
+
+    return events
 
 
-def _estimate_ring_comm_ms(program: Program, hw_config: Dict[str, Any], num_inter_dims: int) -> float:
-    comm_s = 0.0
+def _estimate_ring_events(
+    program: Program,
+    hw_config: Dict[str, Any],
+    topology_metadata: Dict[str, List[int]],
+) -> List[_CommEvent]:
+    events: List[_CommEvent] = []
     comm_nodes = _collect_comm_nodes(program)
 
     for node in comm_nodes:
         if not hasattr(node, "buffer") or not hasattr(node, "comm"):
             continue
         data_bytes = float(_buffer_numel(node.buffer) * get_element_size(node.buffer.dtype))
+
         for ring_comm in node.comm:
+            shard_dim = int(getattr(ring_comm, "shard_dim", 0))
             participants = int(getattr(ring_comm, "num_cards", 1))
+            if 0 <= shard_dim < len(program.mesh.shape):
+                participants = max(participants, int(program.mesh.shape[shard_dim]))
             if participants <= 1:
                 continue
 
-            shard_dim = int(getattr(ring_comm, "shard_dim", 0))
-            inter_node = shard_dim < num_inter_dims
+            inter_node = _is_inter_mesh_dim(shard_dim, topology_metadata)
             bandwidth, latency_s = _link_params(hw_config, inter_node)
 
-            comm_name = str(getattr(ring_comm, "name", "")).lower()
-            if "all_reduce" in comm_name or "allreduce" in comm_name:
-                factor = 2.0 * (participants - 1.0) / participants
-            elif "all_gather" in comm_name or "allgather" in comm_name:
-                factor = (participants - 1.0) / participants
-            elif "reduce_scatter" in comm_name or "reducescatter" in comm_name:
-                factor = (participants - 1.0) / participants
-            else:
-                factor = 1.0
+            rounds = float(participants - 1)
+            if isinstance(node, ReduceOp) and bool(getattr(ring_comm, "write_back", False)):
+                rounds += 1.0
 
-            comm_s += latency_s + factor * (data_bytes / bandwidth)
+            comm_s = rounds * (latency_s + (data_bytes / bandwidth))
 
-    return comm_s * 1000.0
+            overlaps_compute = isinstance(node, (BufferLoad, BufferStore)) and not node.buffer.write
+            events.append(
+                _CommEvent(
+                    time_ms=comm_s * 1000.0,
+                    buffer_name=node.buffer.tensor,
+                    overlaps_compute=overlaps_compute,
+                )
+            )
+
+    return events
 
 
-def estimate_program(program: Program, hw_config: Dict[str, Any], num_inter_dims: int = 1) -> EstimateResult:
+def _estimate_total_with_overlap(
+    compute_time_ms: float,
+    comm_events: List[_CommEvent],
+    output_buffers: Set[str],
+) -> float:
+    comm_time_ms = sum(event.time_ms for event in comm_events)
+    overlappable_comm_ms = 0.0
+    for event in comm_events:
+        if event.overlaps_compute and event.buffer_name not in output_buffers:
+            overlappable_comm_ms += event.time_ms
+    blocking_comm_ms = comm_time_ms - overlappable_comm_ms
+    return blocking_comm_ms + max(compute_time_ms, overlappable_comm_ms)
+
+
+def estimate_program(
+    program: Program,
+    hw_config: Dict[str, Any],
+    num_inter_dims: Optional[int] = None,
+) -> EstimateResult:
     """Estimate compute and communication time for one IR program."""
     if program.mesh is None:
         raise ValueError("Program mesh is not initialized")
@@ -259,11 +398,15 @@ def estimate_program(program: Program, hw_config: Dict[str, Any], num_inter_dims
         raise ValueError("Program has no axes to estimate")
 
     _validate_hardware_config(hw_config)
+    topology_metadata = _normalize_topology_metadata(program, num_inter_dims)
 
     compute_time_ms = _estimate_compute_time_ms(program, hw_config)
-    comm_time_ms = _estimate_reduce_comm_ms(program, hw_config, num_inter_dims)
-    comm_time_ms += _estimate_ring_comm_ms(program, hw_config, num_inter_dims)
-    total_time_ms = compute_time_ms + comm_time_ms
+    comm_events = _estimate_collective_reduce_events(program, hw_config, topology_metadata)
+    comm_events.extend(_estimate_ring_events(program, hw_config, topology_metadata))
+
+    comm_time_ms = sum(event.time_ms for event in comm_events)
+    output_buffers = {buffer.tensor for buffer in _collect_unique_buffers(program) if buffer.write}
+    total_time_ms = _estimate_total_with_overlap(compute_time_ms, comm_events, output_buffers)
 
     return EstimateResult(
         compute_time_ms=compute_time_ms,

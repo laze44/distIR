@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+from collections import defaultdict
 from mercury.ir.primitives import parallelize, shift
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.init_distributed import init_distributed
@@ -9,10 +10,69 @@ from mercury.ir.nodes import Program
 from mercury.ir.elements import Axis
 from mercury.ir.tile import tile_loop
 from mercury.ir.utils import collect_axis, collect_loops, collect_parallelizeable_axes, get_buffers
-from typing import List, Iterator, Tuple
+from typing import Dict, List, Iterator, Tuple
 
 
 MAX_AXIS_TILE_FACTOR = 16
+
+
+def _linear_to_coords(rank: int, shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    coords = [0] * len(shape)
+    remainder = rank
+    for dim_id in range(len(shape) - 1, -1, -1):
+        dim = shape[dim_id]
+        coords[dim_id] = remainder % dim
+        remainder //= dim
+    return tuple(coords)
+
+
+def _infer_topology_metadata(origin_mesh: DeviceMesh, mesh: DeviceMesh) -> Dict[str, List[int]]:
+    """Infer inter/intra-node mesh dimensions after reshaping."""
+    ndim = len(mesh.shape)
+    if len(origin_mesh.shape) <= 1:
+        return {
+            "inter_node_dims": [],
+            "intra_node_dims": list(range(ndim)),
+            "mixed_dims": [],
+        }
+
+    inter_node_dims: List[int] = []
+    intra_node_dims: List[int] = []
+    mixed_dims: List[int] = []
+
+    for dim in range(ndim):
+        groups: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = defaultdict(list)
+        for coords in itertools.product(*[range(v) for v in mesh.shape]):
+            key = tuple(coords[idx] for idx in range(ndim) if idx != dim)
+            groups[key].append(coords)
+
+        inter_changes = False
+        intra_changes = False
+        for grouped_coords in groups.values():
+            inter_vals = set()
+            intra_vals = set()
+            for coords in grouped_coords:
+                rank = mesh.get_device(coords)
+                origin_coords = _linear_to_coords(rank, origin_mesh.shape)
+                inter_vals.add(origin_coords[0])
+                intra_vals.add(origin_coords[1:])
+            inter_changes = inter_changes or len(inter_vals) > 1
+            intra_changes = intra_changes or len(intra_vals) > 1
+
+        if inter_changes and not intra_changes:
+            inter_node_dims.append(dim)
+        elif intra_changes and not inter_changes:
+            intra_node_dims.append(dim)
+        elif inter_changes and intra_changes:
+            mixed_dims.append(dim)
+        else:
+            intra_node_dims.append(dim)
+
+    return {
+        "inter_node_dims": inter_node_dims,
+        "intra_node_dims": intra_node_dims,
+        "mixed_dims": mixed_dims,
+    }
 
 
 def enumerate_mesh_shapes(mesh_size: int, max_dim: int, current_shape: List[int] = None, remaining: int = None) -> Iterator[Tuple[int, ...]]:
@@ -284,6 +344,7 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                 if succ:
                     # print(f"mesh_shape: {mesh_shape}")
                     # print(f"assign: {assign}")
+                    program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
                     yield program
 
                     # enumerate all subset of ringable axes
@@ -301,4 +362,5 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                                     assert succ == True, "should be able to parallelize as we have checked before"
                                     shift(program, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], 1, usd_axes)
                                     cnt += 1
+                            program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
                             yield program

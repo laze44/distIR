@@ -71,7 +71,8 @@ class RingComm(IRNode):
             axis=copy.deepcopy(self.axis, memo),
             num_cards=self.num_cards, 
             name=self.name,
-            shard_dim=self.shard_dim
+            shard_dim=self.shard_dim,
+            write_back=self.write_back,
         )
         memo[id(self)] = result
         return result
@@ -116,6 +117,7 @@ class Program(IRNode):
     outputs: Any
     body: List[Union[IRNode, PyNode]]
     mesh: Optional[DeviceMesh] = None
+    topology_metadata: Dict[str, List[int]] = field(default_factory=dict)
 
     def visit(self, fn: Callable[[IRNode], T], fn_epiloge: Optional[Callable]=None) -> List[T]:
         results = [fn(self)]
@@ -132,6 +134,8 @@ class Program(IRNode):
         res += f"{prefix}Inputs: {self.inputs}\n"
         res += f"{prefix}Defaults: {self.defaults}\n"
         res += f"{prefix}Outputs: {self.outputs}\n"
+        if len(self.topology_metadata) > 0:
+            res += f"{prefix}Topology: {self.topology_metadata}\n"
         res += f"{prefix}Body:\n"
         for node in self.body:
             res += f"{node.__str__(tabs+1)}\n"
@@ -146,7 +150,8 @@ class Program(IRNode):
             defaults=copy.deepcopy(self.defaults, memo),
             outputs=copy.deepcopy(self.outputs, memo),
             body=[node._deepcopy_impl(memo) for node in self.body],
-            mesh=copy.deepcopy(self.mesh, memo) if self.mesh else None)
+            mesh=copy.deepcopy(self.mesh, memo) if self.mesh else None,
+            topology_metadata=copy.deepcopy(self.topology_metadata, memo))
         memo[id(self)] = result
         return result
 

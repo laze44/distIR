@@ -1,18 +1,22 @@
 # Copyright (c) 2025 PICASSO LAB, Licensed under the MIT License.
 
 import ast
+import copy
 import json
 import subprocess
 import sys
 import textwrap
 
 import pytest
+import torch
 
 from example_gemm_ir import search_gemm
 from mercury.backend import generate_pytorch_code
 from mercury.frontend.parser import IRBuilder
-from mercury.ir.distributed import DeviceMesh
+from mercury.ir.distributed import DeviceMesh, ShardType, ShardingSpec
+from mercury.ir.elements import Axis, Buffer
 from mercury.ir.loop_eliminating import eliminate_loops
+from mercury.ir.nodes import AxisDef, BufferLoad, BufferStore, Program, ReduceOp, RingComm
 from mercury.ir.utils import collect_reduce
 from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.search import search
@@ -52,6 +56,95 @@ def _has_all_reduce(program) -> bool:
         if len(reduce_op.shard_dim) > 0:
             return True
     return False
+
+
+def _build_mock_gemm_program(
+    name: str,
+    mesh_shape,
+    ring_dim=None,
+    topology_metadata=None,
+):
+    axis_i = Axis("I", 64, 64)
+    axis_j = Axis("J", 64, 64)
+    axis_k = Axis("K", 64, 64)
+
+    world_size = 1
+    for dim in mesh_shape:
+        world_size *= dim
+    mesh = DeviceMesh(list(range(world_size)), tuple(mesh_shape))
+
+    replicate_specs = [ShardType.REPLICATE, ShardType.REPLICATE]
+    buffer_a = Buffer(
+        tensor=f"{name}_a",
+        shape=[64, 64],
+        bound_axes=[[axis_i], [axis_k]],
+        axes_factor=[[1], [1]],
+        shard_spec=ShardingSpec(mesh, copy.deepcopy(replicate_specs)),
+        read=True,
+        write=False,
+        dtype=torch.float16,
+    )
+    buffer_b = Buffer(
+        tensor=f"{name}_b",
+        shape=[64, 64],
+        bound_axes=[[axis_k], [axis_j]],
+        axes_factor=[[1], [1]],
+        shard_spec=ShardingSpec(mesh, copy.deepcopy(replicate_specs)),
+        read=True,
+        write=False,
+        dtype=torch.float16,
+    )
+    buffer_c = Buffer(
+        tensor=f"{name}_c",
+        shape=[64, 64],
+        bound_axes=[[axis_i], [axis_j]],
+        axes_factor=[[1], [1]],
+        shard_spec=ShardingSpec(mesh, copy.deepcopy(replicate_specs)),
+        read=True,
+        write=True,
+        dtype=torch.float16,
+    )
+
+    ring_comms = []
+    if ring_dim is not None:
+        ring_comms.append(
+            RingComm(
+                axis=axis_k,
+                num_cards=int(mesh.shape[ring_dim]),
+                name=f"{name}_ring",
+                shard_dim=int(ring_dim),
+            )
+        )
+
+    body = [
+        AxisDef(axis_i),
+        AxisDef(axis_j),
+        AxisDef(axis_k),
+        BufferLoad(buffer=buffer_a, indices=[axis_i, axis_k], target=f"{name}_va", comm=ring_comms),
+        BufferLoad(buffer=buffer_b, indices=[axis_k, axis_j], target=f"{name}_vb"),
+        ReduceOp(
+            op="torch.add",
+            buffer=buffer_c,
+            src=f"{name}_va * {name}_vb",
+            axes=[axis_k],
+            collective_op="all_reduce",
+            shard_dim=[],
+            indices=[axis_i, axis_j],
+        ),
+        BufferStore(buffer=buffer_c, indices=[axis_i, axis_j], value=f"{name}_vc"),
+    ]
+
+    program = Program(
+        name=name,
+        inputs=[],
+        defaults=[],
+        outputs=[],
+        body=body,
+        mesh=mesh,
+    )
+    if topology_metadata is not None:
+        program.topology_metadata = topology_metadata
+    return program
 
 
 def test_load_hardware_config_success():
@@ -126,14 +219,12 @@ def test_estimate_invariant_and_non_negative():
     assert len(programs) > 0
 
     config = load_hardware_config("config/h100.json")
-    estimate = estimate_program(programs[0], config, num_inter_dims=0)
+    estimate = estimate_program(programs[0], config)
 
     assert estimate.compute_time_ms >= 0
     assert estimate.comm_time_ms >= 0
     assert estimate.total_time_ms >= 0
-    assert estimate.total_time_ms == pytest.approx(
-        estimate.compute_time_ms + estimate.comm_time_ms
-    )
+    assert estimate.total_time_ms <= estimate.compute_time_ms + estimate.comm_time_ms + 1e-9
 
 
 def test_zero_communication_single_device():
@@ -141,7 +232,7 @@ def test_zero_communication_single_device():
     assert len(programs) > 0
 
     config = load_hardware_config("config/h100.json")
-    estimate = estimate_program(programs[0], config, num_inter_dims=0)
+    estimate = estimate_program(programs[0], config)
     assert estimate.comm_time_ms == pytest.approx(0.0)
 
 
@@ -159,10 +250,90 @@ def test_communication_heavier_than_local_for_comm_cost():
         pytest.skip("No communication-heavy program found in distributed search")
 
     config = load_hardware_config("config/h100.json")
-    local_est = estimate_program(local_programs[0], config, num_inter_dims=0)
-    comm_est = estimate_program(comm_program, config, num_inter_dims=0)
+    local_est = estimate_program(local_programs[0], config)
+    comm_est = estimate_program(comm_program, config)
 
     assert comm_est.comm_time_ms > local_est.comm_time_ms
+
+
+def test_search_candidates_record_topology_metadata():
+    programs = _build_programs(64, 64, 64, (2, 2))
+    assert len(programs) > 0
+
+    metadata = programs[0].topology_metadata
+    assert "inter_node_dims" in metadata
+    assert "intra_node_dims" in metadata
+    for dim in metadata["inter_node_dims"] + metadata["intra_node_dims"]:
+        assert 0 <= dim < len(programs[0].mesh.shape)
+
+
+def test_inter_intra_cost_differs_across_mesh_shape():
+    config = load_hardware_config("config/h100.json")
+
+    inter_program = _build_mock_gemm_program(
+        name="mesh_inter",
+        mesh_shape=(4, 2),
+        ring_dim=0,
+        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1]},
+    )
+    intra_program = _build_mock_gemm_program(
+        name="mesh_intra",
+        mesh_shape=(2, 4),
+        ring_dim=1,
+        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1]},
+    )
+
+    inter_est = estimate_program(inter_program, config)
+    intra_est = estimate_program(intra_program, config)
+
+    assert inter_est.comm_time_ms > intra_est.comm_time_ms
+
+
+def test_ring_candidate_has_higher_comm_time_than_non_ring():
+    config = load_hardware_config("config/h100.json")
+    topology = {"inter_node_dims": [0], "intra_node_dims": [1]}
+
+    non_ring_program = _build_mock_gemm_program(
+        name="no_ring",
+        mesh_shape=(2, 2),
+        ring_dim=None,
+        topology_metadata=topology,
+    )
+    ring_program = _build_mock_gemm_program(
+        name="ring",
+        mesh_shape=(2, 2),
+        ring_dim=1,
+        topology_metadata=topology,
+    )
+
+    non_ring_est = estimate_program(non_ring_program, config)
+    ring_est = estimate_program(ring_program, config)
+    assert ring_est.comm_time_ms > non_ring_est.comm_time_ms
+
+
+def test_topk_ranking_changes_stably_with_topology_and_comm_mode():
+    config = load_hardware_config("config/h100.json")
+
+    no_comm = _build_mock_gemm_program("rank_no_comm", (2, 2), ring_dim=None)
+    ring_dim0 = _build_mock_gemm_program("rank_ring_dim0", (2, 2), ring_dim=0)
+    ring_dim1 = _build_mock_gemm_program("rank_ring_dim1", (2, 2), ring_dim=1)
+    programs = [no_comm, ring_dim0, ring_dim1]
+
+    topo_a = {"inter_node_dims": [0], "intra_node_dims": [1]}
+    for program in programs:
+        program.topology_metadata = topo_a
+    ranked_a = sorted(programs, key=lambda p: estimate_program(p, config).total_time_ms)
+    ranked_a_names = [program.name for program in ranked_a]
+    assert ranked_a_names[0] == "rank_no_comm"
+    assert ranked_a_names[1:] == ["rank_ring_dim1", "rank_ring_dim0"]
+
+    topo_b = {"inter_node_dims": [1], "intra_node_dims": [0]}
+    for program in programs:
+        program.topology_metadata = topo_b
+    ranked_b = sorted(programs, key=lambda p: estimate_program(p, config).total_time_ms)
+    ranked_b_names = [program.name for program in ranked_b]
+    assert ranked_b_names[0] == "rank_no_comm"
+    assert ranked_b_names[1:] == ["rank_ring_dim0", "rank_ring_dim1"]
 
 
 def test_top_k_output_and_summary_schema(tmp_path):
