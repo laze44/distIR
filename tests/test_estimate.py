@@ -357,7 +357,10 @@ def test_top_k_output_and_summary_schema(tmp_path):
     text = summary_txt_path.read_text(encoding="utf-8")
     assert "Summary Metadata (migrated from summary.json):" in text
     assert "config.top_k=3" in text
+    assert "config.mapping_config=config/gemm_tensor_mapping.json" in text
     assert "total_searched=" in text
+    assert "Tensor Mapping Constraints:" in text
+    assert "  A: flexible" in text
     assert "Program 1 (Rank 1):" in text
     assert "Estimated compute time:" in text
     assert "Estimated communication time:" in text
@@ -395,9 +398,41 @@ def test_cli_default_top_k(tmp_path):
     result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
     text = (result_dir / "summary.txt").read_text(encoding="utf-8")
     assert "config.top_k=10" in text
+    assert "config.mapping_config=config/gemm_tensor_mapping.json" in text
 
     code_files = sorted(result_dir.glob("program_*_code.py"))
     assert len(code_files) <= 10
+
+
+def test_cli_mapping_config_summary(tmp_path):
+    out_dir = tmp_path / "cli_results_fixed"
+    cmd = [
+        sys.executable,
+        "example_gemm_ir.py",
+        "--m",
+        "64",
+        "--n",
+        "64",
+        "--k",
+        "64",
+        "--inter-node",
+        "1",
+        "--intra-node",
+        "2",
+        "--output-dir",
+        str(out_dir),
+        "--hw-config",
+        "config/h100.json",
+        "--mapping-config",
+        "config/gemm_tensor_mapping_fixed_example.json",
+    ]
+    subprocess.run(cmd, check=True)
+
+    result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
+    text = (result_dir / "summary.txt").read_text(encoding="utf-8")
+    assert "config.mapping_config=config/gemm_tensor_mapping_fixed_example.json" in text
+    assert "B: fixed [R, S(intra_node)]" in text
+    assert "C: fixed [S(inter_node), S(intra_node)]" in text
 
 
 def test_top_k_must_be_positive(tmp_path):

@@ -14,6 +14,7 @@ setup(
         "torch>=2.6.0",
         "numpy>=1.21.0",
         "flash-attn>=2.7.0",
+        "tqdm>=4.66.0",
     ],
     extras_require={
         "dev": [

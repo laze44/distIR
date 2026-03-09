@@ -3,14 +3,20 @@
 import copy
 import itertools
 from collections import defaultdict
-from mercury.ir.primitives import parallelize, shift
+from typing import Dict, Iterator, List, Optional, Tuple
+from tqdm import tqdm
+
 from mercury.ir.distributed import DeviceMesh
+from mercury.ir.elements import Axis
 from mercury.ir.init_distributed import init_distributed
 from mercury.ir.nodes import Program
-from mercury.ir.elements import Axis
+from mercury.ir.primitives import parallelize, shift
 from mercury.ir.tile import tile_loop
 from mercury.ir.utils import collect_axis, collect_loops, collect_parallelizeable_axes, get_buffers
-from typing import Dict, List, Iterator, Tuple
+from mercury.search.mapping_constraints import (
+    TensorMappingConstraints,
+    program_satisfies_tensor_mapping_constraints,
+)
 
 
 MAX_AXIS_TILE_FACTOR = 16
@@ -199,7 +205,12 @@ def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int])
 #                 return True
 #     return False
 
-def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: List[str] = list()) -> Iterator[Program]:
+def search(
+    input_program: Program,
+    origin_mesh: DeviceMesh,
+    split_axis_names: List[str] = list(),
+    tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+) -> Iterator[Program]:
     """
     Search for the best schedule for a given program.
 
@@ -271,6 +282,13 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                 axes_split.append(axis)
 
     assert len(axes_split) == len(split_axis_names), "split axis not found in the program"
+
+    def _set_metadata_and_match(program: Program, mesh: DeviceMesh) -> bool:
+        program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
+        return program_satisfies_tensor_mapping_constraints(
+            program,
+            tensor_mapping_constraints,
+        )
 
     for split_num in enumerate_axis_split(axes_split, len(origin_mesh.devices), []):
         # try all possible axis split
@@ -344,8 +362,8 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                 if succ:
                     # print(f"mesh_shape: {mesh_shape}")
                     # print(f"assign: {assign}")
-                    program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
-                    yield program
+                    if _set_metadata_and_match(program, mesh):
+                        yield program
 
                     # enumerate all subset of ringable axes
                     for i in range(1, len(ringable_axes) + 1): # start from 1, as empty set is the same as above
@@ -362,5 +380,42 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                                     assert succ == True, "should be able to parallelize as we have checked before"
                                     shift(program, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], 1, usd_axes)
                                     cnt += 1
-                            program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
-                            yield program
+                            if _set_metadata_and_match(program, mesh):
+                                yield program
+
+
+def search_with_progress(
+    input_program: Program,
+    origin_mesh: DeviceMesh,
+    split_axis_names: List[str] = list(),
+    tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+    progress_desc: Optional[str] = None,
+    show_progress: bool = True,
+    miniters: int = 32,
+    mininterval: float = 0.5,
+) -> Iterator[Program]:
+    """Wrap ``search`` with a streaming progress bar for generated candidates.
+
+    The search space size is not known ahead of time, so this progress bar reports
+    the current number of generated candidates and throughput instead of a percentage.
+    """
+    iterator = search(
+        input_program,
+        origin_mesh,
+        split_axis_names,
+        tensor_mapping_constraints,
+    )
+    if not show_progress:
+        yield from iterator
+        return
+
+    with tqdm(
+        desc=progress_desc or "search",
+        unit="cand",
+        dynamic_ncols=True,
+        miniters=max(1, miniters),
+        mininterval=mininterval,
+    ) as progress_bar:
+        for program in iterator:
+            progress_bar.update(1)
+            yield program
