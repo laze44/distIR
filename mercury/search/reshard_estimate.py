@@ -4,8 +4,10 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from mercury.ir.distributed import DeviceMesh, ShardType
-from mercury.ir.elements import Buffer
+import torch
+
+from mercury.ir.distributed import DeviceMesh, ShardType, ShardingSpec
+from mercury.ir.elements import Axis, Buffer
 from mercury.ir.utils import get_element_size
 
 
@@ -291,3 +293,54 @@ def estimate_reshard_time(
         max_rank_time_s = max(max_rank_time_s, rank_time_s)
 
     return max_rank_time_s * 1000.0
+
+
+def _build_buffer_from_logical_layout(
+    tensor_name: str,
+    layout,
+    dtype: torch.dtype,
+) -> Buffer:
+    from mercury.search.mapping_constraints import derive_logical_local_shape
+
+    mesh_shape = tuple(int(dim) for dim in layout.mesh_shape)
+    world_size = 1
+    for dim_size in mesh_shape:
+        world_size *= int(dim_size)
+    mesh = DeviceMesh(devices=list(range(world_size)), shape=mesh_shape)
+
+    local_shape = derive_logical_local_shape(
+        global_shape=tuple(int(dim) for dim in layout.global_shape),
+        mesh_shape=mesh_shape,
+        shard_specs=tuple(layout.shard_specs),
+    )
+    axes = [Axis(f"{tensor_name.upper()}_{dim}", int(dim_size), int(dim_size)) for dim, dim_size in enumerate(local_shape)]
+    specs = []
+    for shard_type, mesh_dims in layout.shard_specs:
+        if shard_type == "R":
+            specs.append(ShardType.REPLICATE)
+        else:
+            specs.append((ShardType.SHARD, [int(dim) for dim in mesh_dims]))
+
+    return Buffer(
+        tensor=tensor_name,
+        shape=[int(dim_size) for dim_size in local_shape],
+        bound_axes=[[axis] for axis in axes],
+        axes_factor=[[1] for _ in axes],
+        shard_spec=ShardingSpec(mesh, specs),
+        read=True,
+        write=False,
+        dtype=dtype,
+    )
+
+
+def estimate_reshard_time_from_logical_layout(
+    src_layout,
+    dst_layout,
+    hw_config: Dict[str, Any],
+    origin_mesh: DeviceMesh,
+    dtype: torch.dtype = torch.bfloat16,
+) -> float:
+    """Estimate reshard latency directly from logical boundary layouts."""
+    src_buffer = _build_buffer_from_logical_layout("src", src_layout, dtype)
+    dst_buffer = _build_buffer_from_logical_layout("dst", dst_layout, dtype)
+    return estimate_reshard_time(src_buffer, dst_buffer, hw_config, origin_mesh)

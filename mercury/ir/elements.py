@@ -107,6 +107,8 @@ class Buffer:
     bound_axes: List[List[Axis]]  # None for unbound dimensions
     axes_factor: List[List[int]] # factor for each axis in each dimension
     shard_spec: Optional[ShardingSpec] = None
+    logical_shard_spec: Optional[ShardingSpec] = None
+    global_shape: Optional[List[int]] = None
     read: bool = False
     write: bool = False
     dtype: torch.dtype = torch.bfloat16
@@ -131,6 +133,12 @@ class Buffer:
                        for axes in self.bound_axes],
             axes_factor=copy.deepcopy(self.axes_factor, memo),
             shard_spec=copy.deepcopy(self.shard_spec, memo) if self.shard_spec else None,
+            logical_shard_spec=(
+                copy.deepcopy(self.logical_shard_spec, memo)
+                if self.logical_shard_spec
+                else None
+            ),
+            global_shape=copy.deepcopy(self.global_shape, memo),
             read=self.read,
             write=self.write,
             dtype=self.dtype)

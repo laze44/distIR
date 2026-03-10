@@ -31,6 +31,8 @@ def test_example_ffn_ir_cli_smoke(tmp_path):
         "config/ffn_tensor_mapping.json",
         "--top-k",
         "2",
+        "--layout-top-k",
+        "2",
     ]
     subprocess.run(cmd, check=True)
 
@@ -62,10 +64,13 @@ def test_example_ffn_ir_cli_smoke(tmp_path):
         assert (result_dir / file_name).exists()
 
     summary_text = (result_dir / "summary.txt").read_text(encoding="utf-8")
-    assert "Selected Layout Nodes:" in summary_text
-    assert "Reshard Costs (ms):" in summary_text
-    assert "Operator Exec Costs (ms):" in summary_text
+    assert "Two-Step Search Results:" in summary_text
+    assert "Step-1 Top Layout Plans:" in summary_text
+    assert "Selected Layout Plan:" in summary_text
+    assert "Selected L_out:" in summary_text
+    assert "Step-2 Operator Costs (ms):" in summary_text
     assert "Requested top_k per operator: 2" in summary_text
+    assert "Requested layout_top_k: 2" in summary_text
     assert "Top-k Candidate Files:" in summary_text
     assert "Rank 2: candidate_index=" in summary_text
     assert "gate:" in summary_text

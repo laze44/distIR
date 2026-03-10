@@ -4,9 +4,10 @@
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from mercury.ir.distributed import ShardType
+from mercury.ir.elements import Buffer
 from mercury.ir.nodes import Program
 from mercury.ir.utils import get_io_buffers
 
@@ -15,6 +16,88 @@ _SUPPORTED_MATRICES = ("A", "B", "C")
 _SUPPORTED_MODES = ("flexible", "fixed")
 _SUPPORTED_TOPOLOGY_TOKENS = ("inter_node", "intra_node", "mixed")
 _SUPPORTED_OPERATORS = ("gate", "up", "down")
+
+
+@dataclass(frozen=True)
+class ExactLayoutSignature:
+    """Exact tensor layout signature used by runtime FFN two-step filtering."""
+
+    mesh_shape: Tuple[int, ...]
+    local_shape: Tuple[int, ...]
+    shard_specs: Tuple[Tuple[str, Tuple[int, ...]], ...]
+
+    def to_summary(self) -> str:
+        specs = []
+        for shard_type, mesh_dims in self.shard_specs:
+            if shard_type == "R":
+                specs.append("R")
+            else:
+                specs.append("S(" + ",".join(str(dim) for dim in mesh_dims) + ")")
+        return (
+            f"mesh={self.mesh_shape}, local_shape={self.local_shape}, "
+            f"specs=[{', '.join(specs)}]"
+        )
+
+
+@dataclass(frozen=True)
+class ExactTensorLayoutConstraints:
+    """Runtime exact-match layout constraints keyed by matrix name."""
+
+    matrices: Dict[str, ExactLayoutSignature]
+
+    def get(self, matrix_name: str) -> Optional[ExactLayoutSignature]:
+        return self.matrices.get(matrix_name)
+
+    def summary_by_matrix(self) -> Dict[str, Optional[str]]:
+        return {
+            matrix_name: (
+                self.matrices[matrix_name].to_summary()
+                if matrix_name in self.matrices
+                else None
+            )
+            for matrix_name in _SUPPORTED_MATRICES
+        }
+
+
+@dataclass(frozen=True)
+class LogicalBoundaryLayoutSignature:
+    """Logical boundary layout independent from execution-local buffer state."""
+
+    mesh_shape: Tuple[int, ...]
+    global_shape: Tuple[int, ...]
+    shard_specs: Tuple[Tuple[str, Tuple[int, ...]], ...]
+
+    def to_summary(self) -> str:
+        specs = []
+        for shard_type, mesh_dims in self.shard_specs:
+            if shard_type == "R":
+                specs.append("R")
+            else:
+                specs.append("S(" + ",".join(str(dim) for dim in mesh_dims) + ")")
+        return (
+            f"mesh={self.mesh_shape}, global_shape={self.global_shape}, "
+            f"specs=[{', '.join(specs)}]"
+        )
+
+
+@dataclass(frozen=True)
+class LogicalTensorLayoutConstraints:
+    """Logical boundary constraints keyed by matrix name."""
+
+    matrices: Dict[str, LogicalBoundaryLayoutSignature]
+
+    def get(self, matrix_name: str) -> Optional[LogicalBoundaryLayoutSignature]:
+        return self.matrices.get(matrix_name)
+
+    def summary_by_matrix(self) -> Dict[str, Optional[str]]:
+        return {
+            matrix_name: (
+                self.matrices[matrix_name].to_summary()
+                if matrix_name in self.matrices
+                else None
+            )
+            for matrix_name in _SUPPORTED_MATRICES
+        }
 
 
 @dataclass(frozen=True)
@@ -261,13 +344,148 @@ def load_operator_tensor_mapping_constraints(
     )
 
 
+def _normalize_exact_spec(
+    spec: Union[ShardType, Tuple[ShardType, List[int]]]
+) -> Tuple[str, Tuple[int, ...]]:
+    if isinstance(spec, tuple):
+        if spec[0] != ShardType.SHARD:
+            raise ValueError(f"Unsupported shard type in exact layout spec: {spec[0]}")
+        return ("S", tuple(int(dim) for dim in spec[1]))
+    if spec == ShardType.REPLICATE:
+        return ("R", tuple())
+    raise ValueError(f"Unsupported exact layout spec: {spec}")
+
+
+def _normalize_logical_spec(
+    spec: Union[ShardType, Tuple[ShardType, List[int]]]
+) -> Tuple[str, Tuple[int, ...]]:
+    if isinstance(spec, tuple):
+        if spec[0] != ShardType.SHARD:
+            raise ValueError(f"Unsupported shard type in logical layout spec: {spec[0]}")
+        return ("S", tuple(int(dim) for dim in spec[1]))
+    if spec == ShardType.REPLICATE:
+        return ("R", tuple())
+    raise ValueError(f"Unsupported logical layout spec: {spec}")
+
+
+def _mesh_cards(mesh_shape: Tuple[int, ...], mesh_dims: Tuple[int, ...]) -> int:
+    cards = 1
+    for mesh_dim in mesh_dims:
+        cards *= int(mesh_shape[int(mesh_dim)])
+    return cards
+
+
+def derive_logical_local_shape(
+    global_shape: Tuple[int, ...],
+    mesh_shape: Tuple[int, ...],
+    shard_specs: Tuple[Tuple[str, Tuple[int, ...]], ...],
+) -> Tuple[int, ...]:
+    """Derive local tensor shape implied by a logical global shape and layout."""
+    if len(global_shape) != len(shard_specs):
+        raise ValueError("global_shape and shard_specs must have identical rank")
+
+    local_shape = []
+    for dim_size, shard_spec in zip(global_shape, shard_specs):
+        if shard_spec[0] == "R":
+            local_shape.append(int(dim_size))
+            continue
+        if shard_spec[0] != "S":
+            raise ValueError(f"Unsupported logical shard spec kind: {shard_spec[0]}")
+        shard_cards = _mesh_cards(mesh_shape, shard_spec[1])
+        if shard_cards <= 0:
+            raise ValueError("shard_cards must be positive")
+        if int(dim_size) % shard_cards != 0:
+            raise ValueError(
+                f"global dim {dim_size} is not divisible by shard cards {shard_cards}"
+            )
+        local_shape.append(int(dim_size) // shard_cards)
+    return tuple(local_shape)
+
+
+def exact_layout_signature_from_buffer(buffer: Buffer) -> ExactLayoutSignature:
+    """Build an exact layout signature from a distributed buffer."""
+    if buffer.shard_spec is None:
+        raise ValueError(f"Buffer {buffer.tensor} has no shard spec")
+
+    return ExactLayoutSignature(
+        mesh_shape=tuple(int(dim) for dim in buffer.shard_spec.mesh.shape),
+        local_shape=tuple(int(dim) for dim in buffer.get_shape()),
+        shard_specs=tuple(_normalize_exact_spec(spec) for spec in buffer.shard_spec.specs),
+    )
+
+
+def logical_layout_signature_from_buffer(
+    buffer: Buffer,
+    use_logical_metadata: bool = False,
+) -> LogicalBoundaryLayoutSignature:
+    """Build a logical boundary layout signature from a distributed buffer."""
+    if use_logical_metadata and buffer.logical_shard_spec is not None:
+        shard_spec = buffer.logical_shard_spec
+    else:
+        shard_spec = buffer.shard_spec
+
+    if shard_spec is None:
+        raise ValueError(f"Buffer {buffer.tensor} has no shard spec")
+
+    if use_logical_metadata and buffer.global_shape is not None:
+        global_shape = tuple(int(dim) for dim in buffer.global_shape)
+    else:
+        local_shape = tuple(int(dim) for dim in buffer.get_shape())
+        shard_specs = tuple(_normalize_logical_spec(spec) for spec in shard_spec.specs)
+        inferred = []
+        for dim_size, shard in zip(local_shape, shard_specs):
+            if shard[0] == "R":
+                inferred.append(int(dim_size))
+            else:
+                inferred.append(int(dim_size) * _mesh_cards(tuple(shard_spec.mesh.shape), shard[1]))
+        global_shape = tuple(inferred)
+
+    return LogicalBoundaryLayoutSignature(
+        mesh_shape=tuple(int(dim) for dim in shard_spec.mesh.shape),
+        global_shape=global_shape,
+        shard_specs=tuple(_normalize_logical_spec(spec) for spec in shard_spec.specs),
+    )
+
+
+def exact_layout_signature_equal(
+    lhs: ExactLayoutSignature,
+    rhs: ExactLayoutSignature,
+) -> bool:
+    """Return whether two exact layout signatures are identical."""
+    return (
+        lhs.mesh_shape == rhs.mesh_shape
+        and lhs.local_shape == rhs.local_shape
+        and lhs.shard_specs == rhs.shard_specs
+    )
+
+
+def logical_layout_signature_equal(
+    lhs: LogicalBoundaryLayoutSignature,
+    rhs: LogicalBoundaryLayoutSignature,
+) -> bool:
+    """Return whether two logical boundary layout signatures are identical."""
+    return (
+        lhs.mesh_shape == rhs.mesh_shape
+        and lhs.global_shape == rhs.global_shape
+        and lhs.shard_specs == rhs.shard_specs
+    )
+
+
 def _resolve_topology_tokens(program: Program, tokens: Tuple[str, ...]) -> Tuple[int, ...]:
     if program.topology_metadata is None:
         raise ValueError("Program topology metadata must be set before matching tensor mappings")
 
+    return resolve_topology_tokens_from_metadata(program.topology_metadata, tokens)
+
+
+def resolve_topology_tokens_from_metadata(
+    topology_metadata: Dict[str, List[int]],
+    tokens: Tuple[str, ...],
+) -> Tuple[int, ...]:
+    """Resolve topology tokens into concrete mesh dimensions."""
     resolved_dims = []
     for token in tokens:
-        dims = program.topology_metadata.get(f"{token}_dims")
+        dims = topology_metadata.get(f"{token}_dims")
         if dims is None:
             raise ValueError(f"Program topology metadata missing key '{token}_dims'")
         resolved_dims.extend(int(dim) for dim in dims)
@@ -317,5 +535,56 @@ def program_satisfies_tensor_mapping_constraints(
             actual_dims = tuple(sorted(int(dim) for dim in spec[1]))
             if actual_dims != expected_dims:
                 return False
+
+    return True
+
+
+def _collect_matrix_buffers(program: Program) -> Dict[str, Buffer]:
+    matrix_buffers: Dict[str, Buffer] = {}
+    buffers = program.visit(get_io_buffers)
+    for buffer in buffers:
+        matrix_name = buffer.tensor.upper()
+        if matrix_name in _SUPPORTED_MATRICES and matrix_name not in matrix_buffers:
+            matrix_buffers[matrix_name] = buffer
+    return matrix_buffers
+
+
+def program_satisfies_logical_layout_constraints(
+    program: Program,
+    constraints: Optional[LogicalTensorLayoutConstraints],
+) -> bool:
+    """Return whether a program matches logical A/B/C boundary layouts."""
+    if constraints is None:
+        return True
+
+    matrix_buffers = _collect_matrix_buffers(program)
+    for matrix_name, expected_signature in constraints.matrices.items():
+        buffer = matrix_buffers.get(matrix_name)
+        if buffer is None or buffer.shard_spec is None:
+            return False
+
+        actual_signature = logical_layout_signature_from_buffer(buffer)
+        if not logical_layout_signature_equal(actual_signature, expected_signature):
+            return False
+    return True
+
+
+def program_satisfies_exact_layout_constraints(
+    program: Program,
+    constraints: Optional[ExactTensorLayoutConstraints],
+) -> bool:
+    """Return whether a program matches exact A/B/C layout signatures."""
+    if constraints is None:
+        return True
+
+    matrix_buffers = _collect_matrix_buffers(program)
+    for matrix_name, expected_signature in constraints.matrices.items():
+        buffer = matrix_buffers.get(matrix_name)
+        if buffer is None or buffer.shard_spec is None:
+            return False
+
+        actual_signature = exact_layout_signature_from_buffer(buffer)
+        if not exact_layout_signature_equal(actual_signature, expected_signature):
+            return False
 
     return True

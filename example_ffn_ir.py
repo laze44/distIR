@@ -1,6 +1,6 @@
 # Copyright (c) 2025 PICASSO LAB, Licensed under the MIT License.
 
-"""Search FFN gate/up/down GEMM candidates and run joint graph-level selection."""
+"""Search FFN gate/up/down GEMM candidates and run two-step graph-level selection."""
 
 import argparse
 import ast
@@ -17,8 +17,8 @@ from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
-from mercury.search.ffn_graph_search import search_ffn as search_ffn_joint
 from mercury.search.mapping_constraints import load_operator_tensor_mapping_constraints
+from mercury.search.ffn_two_step_search import search_ffn_two_step
 from mercury.search.search import search_with_progress
 
 
@@ -121,17 +121,20 @@ def search_ffn(
     intra_node: int,
     output_dir: str,
     top_k: int,
+    layout_top_k: int,
     hw_config_path: str,
     mapping_config_path: str = "config/ffn_tensor_mapping.json",
     show_progress: bool = True,
 ) -> None:
-    """Run FFN search and save the best joint result plus top-k candidates."""
+    """Run FFN search and save the best two-step result plus top-k candidates."""
     if batch <= 0 or seq_len <= 0 or d_model <= 0 or d_ffn <= 0:
         raise ValueError("batch/seq_len/d_model/d_ffn must be positive integers")
     if inter_node <= 0 or intra_node <= 0:
         raise ValueError("inter_node and intra_node must be positive integers")
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
+    if layout_top_k <= 0:
+        raise ValueError("layout_top_k must be a positive integer")
 
     m_len = batch * seq_len
     world_size = inter_node * intra_node
@@ -178,7 +181,17 @@ def search_ffn(
             hw_config,
         )
 
-    joint_result = search_ffn_joint(candidate_programs, hw_config, mesh)
+    two_step_result = search_ffn_two_step(
+        operator_programs=operator_programs,
+        origin_mesh=mesh,
+        split_axis_names=["I", "J", "K"],
+        hw_config=hw_config,
+        tensor_mapping_constraints=constraints,
+        layout_top_k=layout_top_k,
+        candidate_programs=candidate_programs,
+        show_progress=show_progress,
+    )
+    selected_plan = two_step_result.selected_plan
 
     result_dir = os.path.join(
         output_dir,
@@ -190,17 +203,18 @@ def search_ffn(
     os.makedirs(result_dir, exist_ok=True)
 
     summary_lines = [
-        "FFN Joint Search Results",
+        "FFN Two-Step Search Results",
         f"Input: batch={batch}, seq_len={seq_len}, d_model={d_model}, d_ffn={d_ffn}",
         f"Mesh: inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}",
         f"Hardware config: {hw_config['name']}",
         f"Mapping config: {mapping_config_path}",
         f"Requested top_k per operator: {top_k}",
+        f"Requested layout_top_k: {layout_top_k}",
         "",
         "Candidate Counts:",
-        f"  gate: {joint_result.candidate_counts['gate']}",
-        f"  up: {joint_result.candidate_counts['up']}",
-        f"  down: {joint_result.candidate_counts['down']}",
+        f"  gate: {two_step_result.candidate_counts['gate']}",
+        f"  up: {two_step_result.candidate_counts['up']}",
+        f"  down: {two_step_result.candidate_counts['down']}",
         "",
         "Operator Tensor Mapping Constraints:",
     ]
@@ -212,30 +226,76 @@ def search_ffn(
     summary_lines.extend(
         [
             "",
-            "Selected Layout Nodes:",
-            f"  L_in: {joint_result.selected_layouts['L_in']}",
-            f"  L_mid: {joint_result.selected_layouts['L_mid']}",
+            "Two-Step Search Results:",
+            f"  Step-1 ranked plans: {len(two_step_result.ranked_plans)}",
             "",
-            "Reshard Costs (ms):",
+            "Step-1 Top Layout Plans:",
         ]
     )
-    for edge_name, edge_cost in joint_result.edge_costs_ms.items():
-        summary_lines.append(f"  {edge_name}: {edge_cost:.6f}")
+    for plan_rank, layout_plan in enumerate(two_step_result.ranked_plans, start=1):
+        summary_lines.append(
+            f"  Plan {plan_rank}: total={layout_plan.step1_total_time_ms:.6f} ms"
+        )
+        for layout_name in ("L_in", "L_mid", "L_out"):
+            summary_lines.append(
+                f"    {layout_name}: {layout_plan.activation_layouts[layout_name].to_summary()}"
+            )
+        for weight_name in ("W_gate", "W_up", "W_down"):
+            summary_lines.append(
+                f"    {weight_name}: {layout_plan.weight_layouts[weight_name].to_summary()}"
+            )
+        summary_lines.append(
+            "    step1_operator_costs="
+            + ", ".join(
+                f"{operator_name}:{layout_plan.step1_operator_costs_ms[operator_name]:.6f}"
+                for operator_name in _OPERATORS
+            )
+        )
+        summary_lines.append(
+            "    step1_edge_costs="
+            + ", ".join(
+                f"{edge_name}:{edge_cost:.6f}"
+                for edge_name, edge_cost in sorted(layout_plan.step1_edge_costs_ms.items())
+            )
+        )
+        summary_lines.append(
+            f"    explicit_edge_transitions={len(layout_plan.edge_transitions)}"
+        )
 
     summary_lines.extend(
         [
             "",
-            "Operator Exec Costs (ms):",
-            f"  gate: {joint_result.exec_costs_ms['gate']:.6f}",
-            f"  up: {joint_result.exec_costs_ms['up']:.6f}",
-            f"  down: {joint_result.exec_costs_ms['down']:.6f}",
+            "Selected Layout Plan:",
+            f"  L_in: {selected_plan.activation_layouts['L_in'].to_summary()}",
+            f"  L_mid: {selected_plan.activation_layouts['L_mid'].to_summary()}",
+            f"  L_out: {selected_plan.activation_layouts['L_out'].to_summary()}",
+            f"  Selected L_out: {selected_plan.activation_layouts['L_out'].to_summary()}",
+            f"  W_gate: {selected_plan.weight_layouts['W_gate'].to_summary()}",
+            f"  W_up: {selected_plan.weight_layouts['W_up'].to_summary()}",
+            f"  W_down: {selected_plan.weight_layouts['W_down'].to_summary()}",
             "",
-            f"Joint Total Cost (ms): {joint_result.total_time_ms:.6f}",
+            "Step-1 Operator Costs (ms):",
+            f"  gate: {selected_plan.step1_operator_costs_ms['gate']:.6f}",
+            f"  up: {selected_plan.step1_operator_costs_ms['up']:.6f}",
+            f"  down: {selected_plan.step1_operator_costs_ms['down']:.6f}",
+            "Step-1 Edge Costs (ms):",
+            f"  L_in->gate.A: {selected_plan.step1_edge_costs_ms.get('L_in->gate.A', 0.0):.6f}",
+            f"  gate.C->L_mid: {selected_plan.step1_edge_costs_ms.get('gate.C->L_mid', 0.0):.6f}",
+            f"  L_in->up.A: {selected_plan.step1_edge_costs_ms.get('L_in->up.A', 0.0):.6f}",
+            f"  up.C->L_mid: {selected_plan.step1_edge_costs_ms.get('up.C->L_mid', 0.0):.6f}",
+            f"  L_mid->down.A: {selected_plan.step1_edge_costs_ms.get('L_mid->down.A', 0.0):.6f}",
+            "",
+            "Step-2 Operator Costs (ms):",
+            f"  gate: {two_step_result.step2_operator_costs_ms['gate']:.6f}",
+            f"  up: {two_step_result.step2_operator_costs_ms['up']:.6f}",
+            f"  down: {two_step_result.step2_operator_costs_ms['down']:.6f}",
+            "",
+            f"Step-2 Total Cost (ms): {two_step_result.total_time_ms:.6f}",
             "",
             "Selected Candidate Indices:",
-            f"  gate: {joint_result.selected_indices['gate']}",
-            f"  up: {joint_result.selected_indices['up']}",
-            f"  down: {joint_result.selected_indices['down']}",
+            f"  gate: {two_step_result.selected_indices['gate']}",
+            f"  up: {two_step_result.selected_indices['up']}",
+            f"  down: {two_step_result.selected_indices['down']}",
         ]
     )
 
@@ -303,7 +363,8 @@ def search_ffn(
     print(
         "FFN search completed: "
         f"batch={batch}, seq_len={seq_len}, d_model={d_model}, d_ffn={d_ffn}, "
-        f"inter_node={inter_node}, intra_node={intra_node}, top_k={top_k}"
+        f"inter_node={inter_node}, intra_node={intra_node}, "
+        f"top_k={top_k}, layout_top_k={layout_top_k}"
     )
     print(f"Results saved to: {result_dir}/")
     print(f"Summary: {summary_path}")
@@ -312,7 +373,7 @@ def search_ffn(
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Run FFN gate/up/down search and joint layout optimization."
+        description="Run FFN gate/up/down search and two-step layout optimization."
     )
     parser.add_argument("--batch", type=int, default=1, help="Batch size (default: 1)")
     parser.add_argument("--seq-len", type=int, default=256, help="Sequence length (default: 64)")
@@ -355,6 +416,12 @@ def main() -> None:
         help="Number of per-operator IR/code candidates to save (default: 1)",
     )
     parser.add_argument(
+        "--layout-top-k",
+        type=int,
+        default=10,
+        help="Number of step-1 layout plans to keep for step-2 (default: 10)",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="Disable dynamic progress bars during candidate generation",
@@ -370,6 +437,7 @@ def main() -> None:
         intra_node=args.intra_node,
         output_dir=args.output_dir,
         top_k=args.top_k,
+        layout_top_k=args.layout_top_k,
         hw_config_path=args.hw_config,
         mapping_config_path=args.mapping_config,
         show_progress=not args.no_progress,

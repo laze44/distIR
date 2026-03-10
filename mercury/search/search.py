@@ -3,7 +3,7 @@
 import copy
 import itertools
 from collections import defaultdict
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from tqdm import tqdm
 
 from mercury.ir.distributed import DeviceMesh
@@ -210,6 +210,7 @@ def search(
     origin_mesh: DeviceMesh,
     split_axis_names: List[str] = list(),
     tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+    program_filter: Optional[Callable[[Program], bool]] = None,
 ) -> Iterator[Program]:
     """
     Search for the best schedule for a given program.
@@ -226,6 +227,9 @@ def search(
 
     split_axis_names : List[str]
         The axes can be split to multiple dimensions.
+
+    program_filter : Optional[Callable[[Program], bool]]
+        Additional runtime predicate applied after tensor mapping constraints.
 
     Returns
     -------
@@ -285,10 +289,15 @@ def search(
 
     def _set_metadata_and_match(program: Program, mesh: DeviceMesh) -> bool:
         program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
-        return program_satisfies_tensor_mapping_constraints(
+        matches_constraints = program_satisfies_tensor_mapping_constraints(
             program,
             tensor_mapping_constraints,
         )
+        if not matches_constraints:
+            return False
+        if program_filter is None:
+            return True
+        return bool(program_filter(program))
 
     for split_num in enumerate_axis_split(axes_split, len(origin_mesh.devices), []):
         # try all possible axis split
@@ -389,6 +398,7 @@ def search_with_progress(
     origin_mesh: DeviceMesh,
     split_axis_names: List[str] = list(),
     tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+    program_filter: Optional[Callable[[Program], bool]] = None,
     progress_desc: Optional[str] = None,
     show_progress: bool = True,
     miniters: int = 32,
@@ -404,6 +414,7 @@ def search_with_progress(
         origin_mesh,
         split_axis_names,
         tensor_mapping_constraints,
+        program_filter,
     )
     if not show_progress:
         yield from iterator
