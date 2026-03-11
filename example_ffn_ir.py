@@ -112,6 +112,37 @@ def _rank_operator_candidates(
     return ranked_candidates
 
 
+def _serialize_program_for_export(program) -> Tuple[str, str]:
+    program_copy = copy.deepcopy(program)
+    eliminate_loops(program_copy)
+    code = generate_pytorch_code(program_copy)
+    ir_text = _capture_dump(program_copy)
+    return ir_text, code
+
+
+def _write_program_artifacts(
+    result_dir: str,
+    file_prefix: str,
+    program,
+) -> Tuple[str, str]:
+    ir_text, code = _serialize_program_for_export(program)
+    ir_name = f"{file_prefix}_ir.txt"
+    code_name = f"{file_prefix}_code.py"
+    with open(
+        os.path.join(result_dir, ir_name),
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(ir_text)
+    with open(
+        os.path.join(result_dir, code_name),
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(code)
+    return ir_name, code_name
+
+
 def search_ffn(
     batch: int,
     seq_len: int,
@@ -202,6 +233,24 @@ def search_ffn(
     )
     os.makedirs(result_dir, exist_ok=True)
 
+    selected_segment_files: Dict[str, Tuple[str, str]] = {}
+    for segment in two_step_result.selected_segments:
+        if segment.selected_program is None:
+            continue
+        selected_segment_files[segment.segment_id] = _write_program_artifacts(
+            result_dir,
+            f"{segment.segment_id}_selected",
+            segment.selected_program,
+        )
+
+    canonical_selected_files: Dict[str, Tuple[str, str]] = {}
+    for operator_name in _OPERATORS:
+        canonical_selected_files[operator_name] = _write_program_artifacts(
+            result_dir,
+            operator_name,
+            two_step_result.selected_programs[operator_name],
+        )
+
     summary_lines = [
         "FFN Two-Step Search Results",
         f"Input: batch={batch}, seq_len={seq_len}, d_model={d_model}, d_ffn={d_ffn}",
@@ -211,10 +260,23 @@ def search_ffn(
         f"Requested top_k per operator: {top_k}",
         f"Requested layout_top_k: {layout_top_k}",
         "",
-        "Candidate Counts:",
+        "Operator Candidate Counts:",
         f"  gate: {two_step_result.candidate_counts['gate']}",
         f"  up: {two_step_result.candidate_counts['up']}",
         f"  down: {two_step_result.candidate_counts['down']}",
+        "",
+        "Step-1 Layout Plan Counts:",
+        f"  unique L_in: {two_step_result.step1_layout_stats.unique_l_in_count}",
+        f"  unique L_mid: {two_step_result.step1_layout_stats.unique_l_mid_count}",
+        f"  gate boundary classes: {two_step_result.step1_layout_stats.gate_boundary_class_count}",
+        f"  up boundary classes: {two_step_result.step1_layout_stats.up_boundary_class_count}",
+        f"  down boundary classes: {two_step_result.step1_layout_stats.down_boundary_class_count}",
+        f"  projected unique L_out: {two_step_result.step1_layout_stats.projected_l_out_count}",
+        f"  projected unique W_gate: {two_step_result.step1_layout_stats.projected_w_gate_count}",
+        f"  projected unique W_up: {two_step_result.step1_layout_stats.projected_w_up_count}",
+        f"  projected unique W_down: {two_step_result.step1_layout_stats.projected_w_down_count}",
+        f"  total evaluated plans: {two_step_result.step1_layout_stats.total_plan_count}",
+        f"  retained top-k plans: {len(two_step_result.ranked_plans)}",
         "",
         "Operator Tensor Mapping Constraints:",
     ]
@@ -227,7 +289,7 @@ def search_ffn(
         [
             "",
             "Two-Step Search Results:",
-            f"  Step-1 ranked plans: {len(two_step_result.ranked_plans)}",
+            f"  Step-1 retained top-k plans: {len(two_step_result.ranked_plans)}",
             "",
             "Step-1 Top Layout Plans:",
         ]
@@ -243,6 +305,16 @@ def search_ffn(
         for weight_name in ("W_gate", "W_up", "W_down"):
             summary_lines.append(
                 f"    {weight_name}: {layout_plan.weight_layouts[weight_name].to_summary()}"
+            )
+        for operator_name in _OPERATORS:
+            boundary_class = layout_plan.boundary_classes[operator_name]
+            summary_lines.append(
+                (
+                    f"    {operator_name} boundary class: "
+                    f"A={boundary_class.layout_a.to_summary()}, "
+                    f"B={boundary_class.layout_b.to_summary()}, "
+                    f"C={boundary_class.layout_c.to_summary()}"
+                )
             )
         summary_lines.append(
             "    step1_operator_costs="
@@ -273,6 +345,28 @@ def search_ffn(
             f"  W_gate: {selected_plan.weight_layouts['W_gate'].to_summary()}",
             f"  W_up: {selected_plan.weight_layouts['W_up'].to_summary()}",
             f"  W_down: {selected_plan.weight_layouts['W_down'].to_summary()}",
+            (
+                "  gate boundary class: "
+                f"A={selected_plan.boundary_classes['gate'].layout_a.to_summary()}, "
+                f"B={selected_plan.boundary_classes['gate'].layout_b.to_summary()}, "
+                f"C={selected_plan.boundary_classes['gate'].layout_c.to_summary()}"
+            ),
+            (
+                "  up boundary class: "
+                f"A={selected_plan.boundary_classes['up'].layout_a.to_summary()}, "
+                f"B={selected_plan.boundary_classes['up'].layout_b.to_summary()}, "
+                f"C={selected_plan.boundary_classes['up'].layout_c.to_summary()}"
+            ),
+            (
+                "  down boundary class: "
+                f"A={selected_plan.boundary_classes['down'].layout_a.to_summary()}, "
+                f"B={selected_plan.boundary_classes['down'].layout_b.to_summary()}, "
+                f"C={selected_plan.boundary_classes['down'].layout_c.to_summary()}"
+            ),
+            (
+                "  down.C == L_out: "
+                f"{selected_plan.boundary_classes['down'].layout_c == selected_plan.activation_layouts['L_out']}"
+            ),
             "",
             "Step-1 Operator Costs (ms):",
             f"  gate: {selected_plan.step1_operator_costs_ms['gate']:.6f}",
@@ -289,6 +383,72 @@ def search_ffn(
             f"  gate: {two_step_result.step2_operator_costs_ms['gate']:.6f}",
             f"  up: {two_step_result.step2_operator_costs_ms['up']:.6f}",
             f"  down: {two_step_result.step2_operator_costs_ms['down']:.6f}",
+            "Step-2 Segment Costs (ms):",
+        ]
+    )
+    for segment in two_step_result.selected_segments:
+        summary_lines.append(f"  {segment.segment_id}: {segment.total_time_ms:.6f}")
+
+    summary_lines.extend(
+        [
+            "",
+            "Selected Step-2 Segments:",
+        ]
+    )
+    for segment in two_step_result.selected_segments:
+        summary_lines.append(
+            (
+                f"  {segment.segment_id}: kind={segment.segment_kind}, "
+                f"operators={list(segment.logical_operators)}, "
+                f"logical_obligations={list(segment.logical_boundary_obligations)}, "
+                f"materialized_boundaries={list(segment.materialized_boundaries)}, "
+                f"cost={segment.total_time_ms:.6f} ms"
+            )
+        )
+        if segment.selected_program is None:
+            summary_lines.append("    selected_program: none (logical edge-only segment)")
+        else:
+            file_names = selected_segment_files[segment.segment_id]
+            summary_lines.append(
+                (
+                    f"    selected_program: candidate_index={segment.selected_candidate_id}, "
+                    f"IR={file_names[0]}, code={file_names[1]}"
+                )
+            )
+
+    summary_lines.extend(
+        [
+            "",
+            "Explicit Edge Obligations And Ownership:",
+        ]
+    )
+    if len(two_step_result.explicit_edge_obligations) == 0:
+        summary_lines.append("  (none)")
+    else:
+        for edge_name in sorted(two_step_result.explicit_edge_obligations.keys()):
+            edge = two_step_result.explicit_edge_obligations[edge_name]
+            ownership = two_step_result.edge_ownership.get(edge_name)
+            if ownership is None:
+                summary_lines.append(
+                    (
+                        f"  {edge_name}: src={edge.src_layout.to_summary()}, "
+                        f"dst={edge.dst_layout.to_summary()}, "
+                        f"obligation_cost={edge.cost_ms:.6f} ms, ownership=missing"
+                    )
+                )
+                continue
+            summary_lines.append(
+                (
+                    f"  {edge_name}: src={edge.src_layout.to_summary()}, "
+                    f"dst={edge.dst_layout.to_summary()}, "
+                    f"obligation_cost={edge.cost_ms:.6f} ms, "
+                    f"owner={ownership.owner_kind}({ownership.owner_segment_id}), "
+                    f"materialized_standalone={ownership.materialized_as_standalone}"
+                )
+            )
+
+    summary_lines.extend(
+        [
             "",
             f"Step-2 Total Cost (ms): {two_step_result.total_time_ms:.6f}",
             "",
@@ -296,10 +456,30 @@ def search_ffn(
             f"  gate: {two_step_result.selected_indices['gate']}",
             f"  up: {two_step_result.selected_indices['up']}",
             f"  down: {two_step_result.selected_indices['down']}",
+            "",
+            "Canonical Selected Operator Files:",
+            (
+                f"  gate: IR={canonical_selected_files['gate'][0]}, "
+                f"code={canonical_selected_files['gate'][1]}"
+            ),
+            (
+                f"  up: IR={canonical_selected_files['up'][0]}, "
+                f"code={canonical_selected_files['up'][1]}"
+            ),
+            (
+                f"  down: IR={canonical_selected_files['down'][0]}, "
+                f"code={canonical_selected_files['down'][1]}"
+            ),
         ]
     )
 
-    summary_lines.extend(["", "Top-k Candidate Files:"])
+    summary_lines.extend(
+        [
+            "",
+            "Top-k Candidate Files (Non-Canonical Debug):",
+            "  These per-operator rankings are auxiliary and may differ from selected segments.",
+        ]
+    )
 
     for operator_name in _OPERATORS:
         ranked_candidates = ranked_candidates_by_operator[operator_name]
@@ -312,14 +492,9 @@ def search_ffn(
             compute_time_ms,
             comm_time_ms,
         ) in enumerate(ranked_candidates[:save_count], start=1):
-            candidate_program_copy = copy.deepcopy(candidate_program)
-            eliminate_loops(candidate_program_copy)
-            code = generate_pytorch_code(candidate_program_copy)
-            ir_text = _capture_dump(candidate_program_copy)
-
             rank_ir_name = f"{operator_name}_candidate_{rank}_ir.txt"
             rank_code_name = f"{operator_name}_candidate_{rank}_code.py"
-
+            ir_text, code = _serialize_program_for_export(candidate_program)
             with open(
                 os.path.join(result_dir, rank_ir_name),
                 "w",
@@ -332,21 +507,6 @@ def search_ffn(
                 encoding="utf-8",
             ) as file:
                 file.write(code)
-
-            if rank == 1:
-                # Backward-compatible filenames expected by existing workflows/tests.
-                with open(
-                    os.path.join(result_dir, f"{operator_name}_ir.txt"),
-                    "w",
-                    encoding="utf-8",
-                ) as file:
-                    file.write(ir_text)
-                with open(
-                    os.path.join(result_dir, f"{operator_name}_code.py"),
-                    "w",
-                    encoding="utf-8",
-                ) as file:
-                    file.write(code)
 
             summary_lines.append(
                 (
