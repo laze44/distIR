@@ -14,7 +14,7 @@ Auto-tuner 的优化目标是：
 ### 规则 1：两阶段生成（先算后通）
 
 1. 计算阶段：`tile/reorder/join`，确定本地 loop 结构与布局
-2. 通信阶段：`parallelize/shift/shard/replicate`，确定分布式访问与远程内存行为
+2. 通信阶段：`parallelize/shift/shard/replicate` + managed reduction 通信策略（`blocking_collective` / `ring_overlap` / `async_collective_overlap`），确定分布式访问与远程内存行为
 
 好处：
 - 避免大量冗余或非法组合
@@ -43,10 +43,12 @@ Auto-tuner 的优化目标是：
 ### 延迟评估
 
 每个候选都进行完整 lowering 并在真实硬件上 profile，以实测时延为准。
+在理论估算路径中，`async_collective_overlap` 采用 tile 级流水模型（warmup / steady-state / drain）而非将 collective 全量视作阻塞。
 
 ### 内存约束
 
 基于 `CommIR` 的静态布局分析估算 per-worker footprint；超过容量的候选在早期剪枝。
+对 `async_collective_overlap` 额外计入 reduction buffer 双缓冲（stage count）带来的 slot 内存开销。
 
 ## 结果特征（本节结尾）
 

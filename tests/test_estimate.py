@@ -16,7 +16,15 @@ from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh, ShardType, ShardingSpec
 from mercury.ir.elements import Axis, Buffer
 from mercury.ir.loop_eliminating import eliminate_loops
-from mercury.ir.nodes import AxisDef, BufferLoad, BufferStore, Program, ReduceOp, RingComm
+from mercury.ir.nodes import (
+    AsyncCollectiveLifecycle,
+    AxisDef,
+    BufferLoad,
+    BufferStore,
+    Program,
+    ReduceOp,
+    RingComm,
+)
 from mercury.ir.utils import collect_reduce
 from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.search import search
@@ -309,6 +317,52 @@ def test_ring_candidate_has_higher_comm_time_than_non_ring():
     non_ring_est = estimate_program(non_ring_program, config)
     ring_est = estimate_program(ring_program, config)
     assert ring_est.comm_time_ms > non_ring_est.comm_time_ms
+
+
+def test_estimator_distinguishes_blocking_ring_and_async_collective_modes():
+    config = load_hardware_config("config/h100.json")
+    topology = {"inter_node_dims": [0], "intra_node_dims": [1]}
+
+    base = _build_mock_gemm_program(
+        name="mode_base",
+        mesh_shape=(2, 2),
+        ring_dim=None,
+        topology_metadata=topology,
+    )
+    reduce_op = base.visit(collect_reduce)[0]
+    reduce_op.shard_dim = [0]
+    reduce_op.managed_collective_strategy = "blocking_collective"
+
+    ring_program = copy.deepcopy(base)
+    ring_reduce = ring_program.visit(collect_reduce)[0]
+    ring_reduce.comm = [
+        RingComm(
+            axis=ring_reduce.axes[0],
+            num_cards=2,
+            name="mode_ring_reduce",
+            shard_dim=0,
+            write_back=True,
+        )
+    ]
+    ring_reduce.managed_collective_strategy = "ring_overlap"
+
+    async_program = copy.deepcopy(base)
+    async_reduce = async_program.visit(collect_reduce)[0]
+    axis_j = next(axis_def.axis for axis_def in async_program.body if isinstance(axis_def, AxisDef) and axis_def.axis.name == "J")
+    async_reduce.managed_collective_strategy = "async_collective_overlap"
+    async_reduce.async_collective_overlap_axis = axis_j
+    async_reduce.async_collective_tile_count = 4
+    async_reduce.async_collective_stage_count = 2
+    async_reduce.async_collective_lifecycle = AsyncCollectiveLifecycle()
+
+    blocking_est = estimate_program(base, config)
+    ring_est = estimate_program(ring_program, config)
+    async_est = estimate_program(async_program, config)
+
+    assert blocking_est.total_time_ms != ring_est.total_time_ms
+    assert blocking_est.total_time_ms != async_est.total_time_ms
+    assert ring_est.total_time_ms != async_est.total_time_ms
+    assert async_est.total_time_ms < blocking_est.total_time_ms
 
 
 def test_topk_ranking_changes_stably_with_topology_and_comm_mode():

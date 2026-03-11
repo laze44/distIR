@@ -30,5 +30,6 @@ Section 5 还指出其表达能力可迁移到 GEMM 类场景：
 
 - 通过拆分并并行化约简轴表达 TP 风格线性层
 - 在外层 loop 上叠加 `shift` 以表达 AsyncTP 风格策略
+- 在 managed reduction 上加入 `async_collective_overlap`，显式建模 tile 级 `all_reduce` 的 start/wait 与双缓冲流水重叠
 
 因此 `CommIR` 的价值不止于单算子模板，而是提供统一可搜索的分布式设计空间。

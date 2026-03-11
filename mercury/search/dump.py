@@ -34,6 +34,16 @@ def dump(program: Program):
             if len(command.comm) > 0:
                 print(f"    ring for reduce{command.buffer.tensor}: {command.axes} -> {command.comm}")
             elif len(command.shard_dim) > 0:
-                print(f"    all reduce for {command.buffer.tensor}: {command.axes} -> {command.shard_dim}")
+                strategy = getattr(command, "managed_collective_strategy", "blocking_collective")
+                if strategy == "async_collective_overlap":
+                    overlap_axis = getattr(command, "async_collective_overlap_axis", None)
+                    overlap_axis_name = overlap_axis.name if overlap_axis is not None else None
+                    print(
+                        f"    async all reduce for {command.buffer.tensor}: {command.axes} -> {command.shard_dim}, "
+                        f"overlap_axis={overlap_axis_name}, tiles={command.async_collective_tile_count}, "
+                        f"stages={command.async_collective_stage_count}"
+                    )
+                else:
+                    print(f"    all reduce for {command.buffer.tensor}: {command.axes} -> {command.shard_dim}")
 
     

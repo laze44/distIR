@@ -3,7 +3,7 @@
 """PyTorch code generator implementation."""
 
 import copy
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from mercury.ir.nodes import (
     IRNode, Program, GridLoop, BufferLoad, BufferStore,
     PyNode, ReduceOp, AxisDef, BufferMatch
@@ -27,6 +27,8 @@ class PyTorchCodegen:
         self.mesh_shape: Tuple[int, ...] = ()
         self.active_ring_axes = []
         self.reduce_buffers: Dict[str, ReduceOp] = {}
+        self.async_collective_buffers: Dict[str, Dict[str, Any]] = {}
+        self.async_slot_vars: Dict[str, str] = {}
 
     def emit_ring_indice(self, axis: Axis, mesh_dim: int):
         self.emit(f"send_to = shift_tuple_element(indices, {mesh_dim}, 1, {axis.ring_comm_cards})")
@@ -55,6 +57,66 @@ class PyTorchCodegen:
                 ring_axes_names.remove(axis.name)
         return inner_active_axis
 
+    def _collective_shard_dims(self, node: ReduceOp) -> List[int]:
+        ring_dims = set(int(comm.shard_dim) for comm in node.comm)
+        shard_dims = sorted(set(int(dim) for dim in node.shard_dim))
+        return [dim for dim in shard_dims if dim not in ring_dims]
+
+    def _axis_first_condition(self, axes: List[Axis]) -> Optional[str]:
+        conds = []
+        for axis in axes:
+            vars_for_axis = self.axis_vars.get(axis.name, [])
+            for var in vars_for_axis:
+                conds.append(f"{var} == 0")
+        if len(conds) == 0:
+            return None
+        return " and ".join(conds)
+
+    def _axis_last_condition(self, axes: List[Axis]) -> Optional[str]:
+        conds = []
+        for axis in axes:
+            vars_for_axis = self.axis_vars.get(axis.name, [])
+            if len(vars_for_axis) == 0:
+                continue
+            main_var = vars_for_axis[0]
+            axis_end = int(axis.size) // int(axis.ring_comm_cards)
+            conds.append(f"{main_var} + {axis.min_block_size} == {axis_end}")
+        if len(conds) == 0:
+            return None
+        return " and ".join(conds)
+
+    def _buffer_expr(self, tensor_name: str) -> str:
+        config = self.async_collective_buffers.get(tensor_name)
+        if config is None or not config.get("use_slots", False):
+            return tensor_name
+        slot_var = self.async_slot_vars.get(tensor_name, "0")
+        return f"{config['slots_name']}[{slot_var}]"
+
+    def _initialize_collective_state(self, program: Program) -> None:
+        self.reduce_buffers = {}
+        self.async_collective_buffers = {}
+        self.async_slot_vars = {}
+        for reduce_op in program.visit(collect_reduce):
+            self.reduce_buffers[reduce_op.buffer.tensor] = reduce_op
+            collective_shard_dims = tuple(self._collective_shard_dims(reduce_op))
+            if len(collective_shard_dims) == 0:
+                continue
+            if reduce_op.managed_collective_strategy != "async_collective_overlap":
+                continue
+            overlap_axis = reduce_op.async_collective_overlap_axis
+            if overlap_axis is None:
+                continue
+            stage_count = max(2, int(reduce_op.async_collective_stage_count))
+            buffer_name = reduce_op.buffer.tensor
+            self.async_collective_buffers[buffer_name] = {
+                "overlap_axis_name": overlap_axis.name,
+                "stage_count": stage_count,
+                "collective_shard_dims": collective_shard_dims,
+                "slots_name": f"{buffer_name}_async_slots",
+                "works_name": f"{buffer_name}_async_works",
+                "use_slots": False,
+            }
+
     def visit(self, node: IRNode) -> Optional[str]:
         """Visit an IR node and generate code.
         
@@ -81,6 +143,7 @@ class PyTorchCodegen:
 
         # Get reduce target
         tensor_name = node.buffer.tensor
+        tensor_expr = self._buffer_expr(tensor_name)
         indice_str = ""
         if node.indices is not None:
             indices = self.gen_indice(node)
@@ -97,22 +160,64 @@ class PyTorchCodegen:
         #     target = op(target, src)
 
         if len(node.comm) == 0:
-            var_cond = []
-            for axis in node.axes:
-                if axis.name in self.axis_vars:
-                    for var in self.axis_vars[axis.name]:
-                        var_cond.append(f"{var} == 0")
-            if len(var_cond) == 0:
-                self.emit(f"{tensor_name}{indice_str} = {src}")
+            first_axis_cond = self._axis_first_condition(node.axes)
+            if first_axis_cond is None:
+                self.emit(f"{tensor_expr}{indice_str} = {src}")
             else:
-                self.emit(f"if {' and '.join(var_cond)}:")
+                self.emit(f"if {first_axis_cond}:")
                 self.indent_level += 1
-                self.emit(f"{tensor_name}{indice_str} = {src}")
+                self.emit(f"{tensor_expr}{indice_str} = {src}")
                 self.indent_level -= 1
                 self.emit(f"else:")
                 self.indent_level += 1
-                self.emit(f"{tensor_name}{indice_str} = {node.op}({tensor_name}{indice_str}, {src})")
+                self.emit(f"{tensor_expr}{indice_str} = {node.op}({tensor_expr}{indice_str}, {src})")
                 self.indent_level -= 1
+
+            collective_shard_dims = tuple(self._collective_shard_dims(node))
+            if len(collective_shard_dims) > 0:
+                last_axis_cond = self._axis_last_condition(node.axes)
+                strategy = getattr(node, "managed_collective_strategy", "blocking_collective")
+                if strategy == "async_collective_overlap":
+                    config = self.async_collective_buffers.get(tensor_name)
+                    if config is None:
+                        raise ValueError(
+                            f"Missing async collective state for reduction buffer '{tensor_name}'"
+                        )
+                    slot_var = self.async_slot_vars.get(tensor_name, "0")
+                    works_name = config["works_name"]
+                    collective_group = (
+                        f"get_device_group(indices, {self.mesh_shape}, {collective_shard_dims})"
+                    )
+                    lifecycle = node.async_collective_lifecycle
+                    if last_axis_cond is not None:
+                        self.emit(f"if {last_axis_cond}:")
+                        self.indent_level += 1
+                    if lifecycle is not None:
+                        self.emit(f"# {lifecycle.wait_on_reuse_op}")
+                    self.emit(f"if {works_name}[{slot_var}] is not None:")
+                    self.indent_level += 1
+                    self.emit(f"{works_name}[{slot_var}].wait()")
+                    self.indent_level -= 1
+                    if lifecycle is not None:
+                        self.emit(f"# {lifecycle.start_op}")
+                    self.emit(
+                        f"{works_name}[{slot_var}] = dist.all_reduce("
+                        f"{tensor_expr}, op=dist.ReduceOp.SUM, group={collective_group}, async_op=True)"
+                    )
+                    if last_axis_cond is not None:
+                        self.indent_level -= 1
+                else:
+                    collective_stmt = (
+                        f"{node.collective_op}({tensor_expr}, dist.all_reduce, "
+                        f"group=get_device_group(indices, {self.mesh_shape}, {collective_shard_dims}))"
+                    )
+                    if last_axis_cond is None:
+                        self.emit(collective_stmt)
+                    else:
+                        self.emit(f"if {last_axis_cond}:")
+                        self.indent_level += 1
+                        self.emit(collective_stmt)
+                        self.indent_level -= 1
         else:
             axes:List[Axis] = [comm.axis for comm in node.comm]
             mesh_dims: List[int] = [comm.shard_dim for comm in node.comm]
@@ -136,19 +241,19 @@ class PyTorchCodegen:
                 self.indent_level += 1
             self.emit(f"if {all_indices_zero}:")
             self.indent_level += 1
-            self.emit(f"{tensor_name}{indice_str} = {src}.contiguous()")
+            self.emit(f"{tensor_expr}{indice_str} = {src}.contiguous()")
             self.emit(f"{comm_name} = SendRecv()")
             self.indent_level -= 1
             self.emit(f"else:")
             self.indent_level += 1
             self.emit(f"{comm_name}.wait()")
-            self.emit(f"{tensor_name}{indice_str} = {node.op}({self.next_prefix}{tensor_name}, {src})")
+            self.emit(f"{tensor_expr}{indice_str} = {node.op}({self.next_prefix}{tensor_name}, {src})")
             self.indent_level -= 1
             if len(inner_active_axis) > 0:
                 self.indent_level -= 1
                 self.emit(f"else:")
                 self.indent_level += 1
-                self.emit(f"{tensor_name}{indice_str} = {node.op}({tensor_name}{indice_str}, {src})")
+                self.emit(f"{tensor_expr}{indice_str} = {node.op}({tensor_expr}{indice_str}, {src})")
                 self.indent_level -= 1
 
             # if inner_axis is last
@@ -172,7 +277,7 @@ class PyTorchCodegen:
                 self.indent_level += 1
 
                 self.emit_ring_indice(axis, mesh_dim)
-                self.emit(f"{self.next_prefix}{tensor_name} = {comm_name}.send_recv(send_to, recv_from, {tensor_name}{indice_str})")
+                self.emit(f"{self.next_prefix}{tensor_name} = {comm_name}.send_recv(send_to, recv_from, {tensor_expr}{indice_str})")
                 self.emit(f"{comm_name}.commit()")
                 self.indent_level -= 1
                 last_axis, last_mesh_dim = axis, mesh_dim
@@ -181,10 +286,10 @@ class PyTorchCodegen:
             self.emit("else:")
             self.indent_level += 1
             self.emit(f"recv_from, send_to = get_src_dst_ranks(indices, {self.mesh_shape}, {mesh_dims})")
-            self.emit(f"{self.next_prefix}{tensor_name} = {comm_name}.send_recv(send_to, recv_from, {tensor_name}{indice_str})")
+            self.emit(f"{self.next_prefix}{tensor_name} = {comm_name}.send_recv(send_to, recv_from, {tensor_expr}{indice_str})")
             self.emit(f"{comm_name}.commit()")
             self.emit(f"{comm_name}.wait()")
-            self.emit(f"{tensor_name}{indice_str} = {self.next_prefix}{tensor_name}")
+            self.emit(f"{tensor_expr}{indice_str} = {self.next_prefix}{tensor_name}")
             self.indent_level -= 1
             if len(inner_active_axis) > 0:
                 self.indent_level -= 1
@@ -197,7 +302,25 @@ class PyTorchCodegen:
             # Generate shape assertion
             shape_str = str(tuple(s for s in node.buffer.shape))
             self.emit(f"assert {node.buffer.tensor}.shape == {shape_str}, 'Shape mismatch for {node.buffer.tensor}'")
+            async_config = self.async_collective_buffers.get(node.buffer.tensor)
+            if async_config is not None:
+                works_name = async_config["works_name"]
+                stage_count = async_config["stage_count"]
+                self.emit(f"{works_name} = [None for _ in range({stage_count})]")
         elif node.tensor_name is None and isinstance(node.buffer.tensor, str):
+            async_config = self.async_collective_buffers.get(node.buffer.tensor)
+            if async_config is not None:
+                shape = tuple(node.buffer.get_shape())
+                slots_name = async_config["slots_name"]
+                works_name = async_config["works_name"]
+                stage_count = async_config["stage_count"]
+                async_config["use_slots"] = True
+                self.emit(
+                    f"{slots_name} = [torch.empty({shape}, dtype={node.buffer.dtype}, device=device) "
+                    f"for _ in range({stage_count})]"
+                )
+                self.emit(f"{works_name} = [None for _ in range({stage_count})]")
+                return
             # Generate temporary buffer
             if len(self.active_ring_axes) > 0:
                 # when in a ring, only the first step need to load the data
@@ -211,6 +334,8 @@ class PyTorchCodegen:
 
     def visit_Program(self, node: Program) -> None:
         """Generate code for a Program node."""
+        self._initialize_collective_state(node)
+
         # Import os
         self.emit("import os")
         # Import torch
@@ -266,11 +391,13 @@ class PyTorchCodegen:
         indent_add = []
         old_active_ring_axes = self.active_ring_axes
         self.active_ring_axes = copy.deepcopy(self.active_ring_axes)
+        old_async_slot_vars = copy.deepcopy(self.async_slot_vars)
 
         ring_axes = []
         # Generate nested loops
         for axis in node.axes:
             var = axis.name
+            slot_index_var = var
             begin = 0
             end = axis.size
             stride = axis.min_block_size
@@ -312,6 +439,16 @@ class PyTorchCodegen:
                 self.axis_vars[axis.name] = axis_var
                 indent_add.append(len(axis_var))
                 self.active_ring_axes.append(axis)
+                slot_index_var = axis_var[0]
+
+            for buffer_name, config in self.async_collective_buffers.items():
+                if config["overlap_axis_name"] != axis.name:
+                    continue
+                slot_var = f"{buffer_name}_async_slot"
+                self.async_slot_vars[buffer_name] = slot_var
+                self.emit(
+                    f"{slot_var} = ({slot_index_var} // {axis.min_block_size}) % {config['stage_count']}"
+                )
         
         # Generate loop body
         for child in node.body:
@@ -319,15 +456,6 @@ class PyTorchCodegen:
             if isinstance(result, str):
                 self.emit(result)
         
-        # collect reduce ops
-        reduce_ops = node.visit(collect_reduce)
-        axis2reduce = {}
-        for reduce_op in reduce_ops:
-            for axis in reduce_op.axes:
-                if axis.name not in axis2reduce:
-                    axis2reduce[axis.name] = []
-                axis2reduce[axis.name].append(reduce_op)
-
         # End loops
         # remove ring axes
         for axis in ring_axes:
@@ -341,6 +469,18 @@ class PyTorchCodegen:
                 if axis.name in self.active_axis:
                     self.active_axis.remove(axis)
                     self.axis_vars[axis.name] = []
+                for buffer_name, config in self.async_collective_buffers.items():
+                    if config["overlap_axis_name"] != axis.name:
+                        continue
+                    works_name = config["works_name"]
+                    self.emit(f"for _slot in range({config['stage_count']}):")
+                    self.indent_level += 1
+                    self.emit(f"if {works_name}[_slot] is not None:")
+                    self.indent_level += 1
+                    self.emit(f"{works_name}[_slot].wait()")
+                    self.emit(f"{works_name}[_slot] = None")
+                    self.indent_level -= 1
+                    self.indent_level -= 1
             # this is a ad-hoc solution, now we create the collective when the buffer is loaded
             # if axis.name in axis2reduce:
             #     reduce_ops = axis2reduce[axis.name]
@@ -353,6 +493,7 @@ class PyTorchCodegen:
             #             self.emit(f"{reduce_op.collective_op}({reduce_op.buffer.tensor}, dist.all_reduce, group=get_device_group(indices, {self.mesh_shape}, {reduce_op.shard_dim}))")
 
         self.active_ring_axes = old_active_ring_axes
+        self.async_slot_vars = old_async_slot_vars
 
     def gen_indice(self, node: Union[BufferLoad, BufferStore]) -> List:
         # Handle indices
@@ -400,45 +541,33 @@ class PyTorchCodegen:
         indices = self.gen_indice(node)
         # Get input tensor name from buffer map
         tensor_name = node.buffer.tensor
+        tensor_expr = self._buffer_expr(tensor_name)
         
         # Generate indexing expression
         index_str = f"[{', '.join(indices)}]"
 
-        expr = f"{tensor_name}{index_str}"
+        expr = f"{tensor_expr}{index_str}"
         target = node.target
 
 
         if len(node.comm) == 0:
-            # if len(self.active_ring_axes) > 0:
-            #     # when in a ring, only the first step need to load the data
-            #     all_indices_zero = " and ".join([f"{axis.name}{self.ring_idx_suffix} == 0" for axis in self.active_ring_axes])
-            #     self.emit(f"if {all_indices_zero}:")
-            #     self.indent_level += 1
-            #     self.emit(f"{target} = {expr}")
-            #     self.indent_level -= 1
-            # else:
-
-            # tackle the reduce buffer
-            if node.buffer.tensor in self.reduce_buffers:
-                reduce_op = self.reduce_buffers[node.buffer.tensor]
-                if reduce_op.buffer.tensor != node.buffer.tensor:
-                    raise ValueError("reduce buffer tensor name mismatch")
-
-                if len(reduce_op.shard_dim) > 0: # is sharded
-                    shard_dims = set(reduce_op.shard_dim)
-                    for comm in reduce_op.comm:
-                        shard_dims.remove(comm.shard_dim)
-                    if len(shard_dims) > 0: # if not fully ringed
-                        if len(self.active_ring_axes) > 0:
-                            # when in a ring, only the last step need to store the data
-                            all_indices_max = " and ".join([f"{axis.name}{self.ring_idx_suffix} == {axis.ring_comm_cards - 1}" for axis in self.active_ring_axes])
-                            self.emit(f"if {all_indices_max}:")
-                            self.indent_level += 1
-                            self.emit(f"{reduce_op.collective_op}({reduce_op.buffer.tensor}, dist.all_reduce, group=get_device_group(indices, {self.mesh_shape}, {tuple(shard_dims)}))")
-                            self.indent_level -= 1
-                        else:
-                            self.emit(f"{reduce_op.collective_op}({reduce_op.buffer.tensor}, dist.all_reduce, group=get_device_group(indices, {self.mesh_shape}, {tuple(shard_dims)}))")
-
+            reduce_op = self.reduce_buffers.get(node.buffer.tensor)
+            if (
+                reduce_op is not None
+                and reduce_op.managed_collective_strategy == "async_collective_overlap"
+                and node.buffer.tensor in self.async_collective_buffers
+            ):
+                config = self.async_collective_buffers[node.buffer.tensor]
+                works_name = config["works_name"]
+                slot_var = self.async_slot_vars.get(node.buffer.tensor, "0")
+                lifecycle = reduce_op.async_collective_lifecycle
+                if lifecycle is not None:
+                    self.emit(f"# {lifecycle.drain_wait_op}")
+                self.emit(f"if {works_name}[{slot_var}] is not None:")
+                self.indent_level += 1
+                self.emit(f"{works_name}[{slot_var}].wait()")
+                self.emit(f"{works_name}[{slot_var}] = None")
+                self.indent_level -= 1
             self.emit(f"{target} = {expr}")
         else:
             assert node.buffer.write == False, "both read and write is only supported for reduction"
@@ -501,6 +630,7 @@ class PyTorchCodegen:
         tensor_name = node.buffer.tensor
         if tensor_name is None:
             raise ValueError(f"No mapping found for buffer {node.buffer.tensor}")
+        tensor_expr = self._buffer_expr(tensor_name)
         
         # Generate indexing expression
         index_str = f"[{', '.join(indices)}]"
@@ -517,10 +647,10 @@ class PyTorchCodegen:
                 all_indices_max = " and ".join([f"{axis.name}{self.ring_idx_suffix} == {axis.ring_comm_cards - 1}" for axis in self.active_ring_axes])
                 self.emit(f"if {all_indices_max}:")
                 self.indent_level += 1
-                self.emit(f"{tensor_name}{index_str} = {value}")
+                self.emit(f"{tensor_expr}{index_str} = {value}")
                 self.indent_level -= 1
             else:
-                self.emit(f"{tensor_name}{index_str} = {value}")
+                self.emit(f"{tensor_expr}{index_str} = {value}")
         else:
             raise ValueError("Communication not supported for store operations")
 
