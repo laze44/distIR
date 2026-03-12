@@ -18,8 +18,8 @@
       "latency_us": 3.0
     },
     "inter_node": {
-      "bandwidth_gb_per_s": 400.0,
-      "latency_us": 5.0
+      "bandwidth_gb_per_s": 100.0,
+      "latency_us": 20.0
     }
   }
 }

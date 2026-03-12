@@ -16,5 +16,6 @@ Thumbs.db
 *.swp
 *.log
 .env*
-
 .codex
+
+

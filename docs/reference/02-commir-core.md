@@ -19,6 +19,7 @@
 - `shift(local_loop, parallel_loop)`：相对并行维度错位访问，形成异步/交错通信
 - `shard(buffer, loop)`：按并行维对 buffer 分片
 - `replicate(buffer, loop)`：在并行参与者间复制 buffer
+- `async_collective_overlap(reduce, overlap_axis, stage_count)`：为 managed reduction 显式标注异步 collective 的 `start/wait` 生命周期与双缓冲流水
 
 论文强调：这四个原语是“注解语义”，主要在 lowering 阶段解释，不在变换当下直接插通信调用。
 
@@ -54,3 +55,11 @@
 - 约简结果若仍是分片布局，可退化为 ReduceScatter
 
 具体 collective 类型由算子语义（如 sum/product）与布局共同决定。
+
+在 managed reduction 的 async overlap 路径中，lowering 会显式生成：
+
+- collective `start`（例如 `dist.all_reduce(..., async_op=True)`）
+- slot 复用前 `wait`
+- loop 末尾 `drain wait`
+
+从而替代旧版“在 `load_buffer(reduce_buf)` 时隐式触发阻塞 collective”的行为。

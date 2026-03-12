@@ -18,7 +18,9 @@ from mercury.ir.loop_eliminating import eliminate_loops
 from mercury.ir.utils import get_io_buffers
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
-from mercury.search.search import search
+from mercury.search.gemm_two_step_search import search_gemm_two_step
+from mercury.search.mapping_constraints import load_tensor_mapping_constraints
+from mercury.search.search import search_with_progress
 
 
 def _extract_template_from_file(template_name: str) -> str:
@@ -165,6 +167,8 @@ def search_gemm(
     output_dir: str,
     top_k: int,
     hw_config_path: str,
+    mapping_config_path: str = "config/gemm_tensor_mapping.json",
+    show_progress: bool = True,
 ) -> None:
     """Search all tiling/parallelism configurations and save results.
 
@@ -177,6 +181,7 @@ def search_gemm(
         output_dir: Directory to write result files into.
         top_k: Number of best estimated programs to persist.
         hw_config_path: Path to hardware configuration JSON file.
+        mapping_config_path: Path to tensor mapping constraint JSON file.
     """
     if inter_node <= 0 or intra_node <= 0:
         raise ValueError("inter_node and intra_node must be positive integers")
@@ -200,12 +205,34 @@ def search_gemm(
 
     devices = list(range(world_size))
     mesh = DeviceMesh(devices, (inter_node, intra_node))
+    tensor_mapping_constraints = load_tensor_mapping_constraints(mapping_config_path)
 
-    searched_programs = list(search(program, mesh, ["I", "J", "K"]))
+    searched_programs = list(
+        search_with_progress(
+            program,
+            mesh,
+            ["I", "J", "K"],
+            tensor_mapping_constraints=tensor_mapping_constraints,
+            progress_desc=f"search[gemm {m}x{n}x{k}]",
+            show_progress=show_progress,
+            miniters=32,
+            mininterval=0.5,
+        )
+    )
     # Sort for deterministic ordering (same approach as test_search_gemm.py)
     searched_programs.sort(key=lambda x: generate_pytorch_code(x))
 
     hw_config = load_hardware_config(hw_config_path)
+    two_step_result = search_gemm_two_step(
+        input_program=program,
+        origin_mesh=mesh,
+        split_axis_names=["I", "J", "K"],
+        hw_config=hw_config,
+        tensor_mapping_constraints=tensor_mapping_constraints,
+        layout_top_k=top_k,
+        candidate_programs=searched_programs,
+        show_progress=show_progress,
+    )
 
     estimated_programs = []
     for res_program in searched_programs:
@@ -233,6 +260,7 @@ def search_gemm(
         f"Total programs searched: {len(searched_programs)}",
         f"Top-k saved: {save_count}",
         f"Hardware config: {hw_config['name']}",
+        f"Tensor mapping config: {mapping_config_path}",
         "",
     ]
 
@@ -246,9 +274,64 @@ def search_gemm(
         f"  config.world_size={world_size}",
         f"  config.hardware={hw_config['name']}",
         f"  config.top_k={top_k}",
+        f"  config.mapping_config={mapping_config_path}",
         f"  total_searched={len(searched_programs)}",
         "",
+        "Tensor Mapping Constraints:",
     ])
+
+    for tensor_name, summary in tensor_mapping_constraints.summary_by_matrix().items():
+        summary_lines.append(f"  {tensor_name}: {summary}")
+
+    summary_lines.extend(
+        [
+            "",
+            "Two-Step Search:",
+            f"  Step-1 ranked plans: {len(two_step_result.ranked_plans)}",
+            f"  Step-2 seed candidates: {two_step_result.candidate_count}",
+            f"  Unsupported step-1 plans in step-2: {two_step_result.unsupported_plan_count}",
+            "",
+            "Step-1 Top Layout Plans:",
+        ]
+    )
+    for plan_rank, plan in enumerate(two_step_result.ranked_plans, start=1):
+        summary_lines.append(
+            f"  Plan {plan_rank}: total={plan.step1_total_time_ms:.6f} ms"
+        )
+        summary_lines.append(f"    A: {plan.boundary_layouts['A'].to_summary()}")
+        summary_lines.append(f"    B: {plan.boundary_layouts['B'].to_summary()}")
+        summary_lines.append(f"    C: {plan.boundary_layouts['C'].to_summary()}")
+        summary_lines.append(
+            "    obligations(bytes)="
+            + ", ".join(
+                f"{name}:{value:.1f}"
+                for name, value in plan.step1_obligations_bytes.items()
+            )
+        )
+        summary_lines.append(
+            "    costs(ms)="
+            + ", ".join(
+                f"{name}:{value:.6f}"
+                for name, value in plan.step1_cost_terms_ms.items()
+            )
+        )
+
+    selected_plan = two_step_result.selected_plan
+    summary_lines.extend(
+        [
+            "",
+            "Selected Two-Step Plan:",
+            f"  A: {selected_plan.boundary_layouts['A'].to_summary()}",
+            f"  B: {selected_plan.boundary_layouts['B'].to_summary()}",
+            f"  C: {selected_plan.boundary_layouts['C'].to_summary()}",
+            (
+                "  Step-2 selected candidate index: "
+                f"{two_step_result.selected_index}, "
+                f"total={two_step_result.selected_step2_total_time_ms:.6f} ms"
+            ),
+            "",
+        ]
+    )
 
     for idx, (res_program, estimate) in enumerate(selected_programs):
         code = generate_pytorch_code(res_program)
@@ -347,6 +430,20 @@ def main() -> None:
         default="config/h100.json",
         help="Hardware configuration JSON path (default: config/h100.json)",
     )
+    parser.add_argument(
+        "--mapping-config",
+        type=str,
+        default="config/gemm_tensor_mapping.json",
+        help=(
+            "Tensor mapping constraint JSON path "
+            "(default: config/gemm_tensor_mapping.json)"
+        ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable dynamic progress bars during candidate generation",
+    )
     args = parser.parse_args()
     search_gemm(
         args.m,
@@ -357,6 +454,8 @@ def main() -> None:
         args.output_dir,
         args.top_k,
         args.hw_config,
+        args.mapping_config,
+        not args.no_progress,
     )
 
 

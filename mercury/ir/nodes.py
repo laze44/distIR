@@ -77,6 +77,15 @@ class RingComm(IRNode):
         memo[id(self)] = result
         return result
 
+
+@dataclass
+class AsyncCollectiveLifecycle:
+    """Explicit async collective lifecycle markers for managed reductions."""
+
+    start_op: str = "all_reduce_start"
+    wait_on_reuse_op: str = "all_reduce_wait_on_reuse"
+    drain_wait_op: str = "all_reduce_wait_drain"
+
 @dataclass
 class PyNode(IRNode):
     """Node for preserving original Python AST."""
@@ -375,6 +384,11 @@ class ReduceOp(IRNode):
     comm: List[RingComm] = field(default_factory=list)
     shard_dim: List[int] = field(default_factory=list)
     indices: Optional[List[Union[int, Axis, PyNode]]] = None
+    managed_collective_strategy: str = "blocking_collective"
+    async_collective_overlap_axis: Optional[Axis] = None
+    async_collective_tile_count: int = 1
+    async_collective_stage_count: int = 1
+    async_collective_lifecycle: Optional[AsyncCollectiveLifecycle] = None
 
     def visit(self, fn: Callable[[IRNode], T], fn_epiloge: Optional[Callable]=None) -> List[T]:
         results = [fn(self)]
@@ -401,7 +415,13 @@ class ReduceOp(IRNode):
                    else self.src,
             comm=[comm._deepcopy_impl(memo) for comm in self.comm],
             shard_dim=copy.deepcopy(self.shard_dim, memo),
-            indices=new_indices)
+            indices=new_indices,
+            managed_collective_strategy=self.managed_collective_strategy,
+            async_collective_overlap_axis=copy.deepcopy(self.async_collective_overlap_axis, memo),
+            async_collective_tile_count=self.async_collective_tile_count,
+            async_collective_stage_count=self.async_collective_stage_count,
+            async_collective_lifecycle=copy.deepcopy(self.async_collective_lifecycle, memo),
+        )
         memo[id(self)] = result
         return result
     
@@ -409,6 +429,18 @@ class ReduceOp(IRNode):
         prefix = "  " * tabs
         res = prefix + f"{self.op}({self.buffer.tensor}[{_format_indices(self.indices) if self.indices is not None else None}], axes={self.axes}, src={self.src}) (collective_op={self.collective_op})"
         res += f" {self.comm} with shard_dim={self.shard_dim}"
+        if self.managed_collective_strategy != "blocking_collective":
+            overlap_axis = (
+                self.async_collective_overlap_axis.name
+                if self.async_collective_overlap_axis is not None
+                else None
+            )
+            res += (
+                f" strategy={self.managed_collective_strategy}"
+                f" overlap_axis={overlap_axis}"
+                f" tiles={self.async_collective_tile_count}"
+                f" stages={self.async_collective_stage_count}"
+            )
         return res
 
 def _format_value(value: Union[BufferLoad, float, PyNode]) -> str:

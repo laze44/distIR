@@ -16,6 +16,13 @@ def get_buffer_size(program: IRNode) -> int:
         
     buffers = program.visit(get_buffers)
     reduce_ops = program.visit(collect_reduce)
+    async_stage_count = {}
+    for reduce_op in reduce_ops:
+        if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") != "async_collective_overlap":
+            continue
+        buffer_name = reduce_op.buffer.tensor
+        stage_count = max(2, int(getattr(reduce_op, "async_collective_stage_count", 2)))
+        async_stage_count[buffer_name] = max(async_stage_count.get(buffer_name, 1), stage_count)
 
     total_size = 0
     for buffer in buffers:
@@ -60,5 +67,7 @@ def get_buffer_size(program: IRNode) -> int:
 
         if is_reduce:
             total_size += buffer_size # if is reduce buffer, we would need another buffer to store local res
+        if buffer.tensor in async_stage_count:
+            total_size += buffer_size * (async_stage_count[buffer.tensor] - 1)
 
     return total_size

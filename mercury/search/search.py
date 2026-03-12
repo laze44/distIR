@@ -3,17 +3,32 @@
 import copy
 import itertools
 from collections import defaultdict
-from mercury.ir.primitives import parallelize, shift
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from tqdm import tqdm
+
 from mercury.ir.distributed import DeviceMesh
-from mercury.ir.init_distributed import init_distributed
-from mercury.ir.nodes import Program
 from mercury.ir.elements import Axis
+from mercury.ir.init_distributed import init_distributed
+from mercury.ir.nodes import AsyncCollectiveLifecycle, Program
+from mercury.ir.primitives import parallelize, shift
 from mercury.ir.tile import tile_loop
-from mercury.ir.utils import collect_axis, collect_loops, collect_parallelizeable_axes, get_buffers
-from typing import Dict, List, Iterator, Tuple
+from mercury.ir.utils import (
+    collect_axis,
+    collect_loops,
+    collect_parallelizeable_axes,
+    collect_reduce,
+    get_buffers,
+    get_element_size,
+)
+from mercury.search.mapping_constraints import (
+    TensorMappingConstraints,
+    program_satisfies_tensor_mapping_constraints,
+)
 
 
 MAX_AXIS_TILE_FACTOR = 16
+DEFAULT_ASYNC_COLLECTIVE_STAGE_COUNT = 2
+DEFAULT_ASYNC_COLLECTIVE_MEMORY_BUDGET_BYTES = 80 * (2 ** 30)
 
 
 def _linear_to_coords(rank: int, shape: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -184,6 +199,152 @@ def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int])
             yield from enumerate_axis_split(axes, res_cards, cur_split + [factor])
 
 
+def _collective_shard_dims(reduce_op, mesh_ndim: int) -> List[int]:
+    ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
+    shard_dims = sorted(
+        set(
+            int(dim)
+            for dim in reduce_op.shard_dim
+            if 0 <= int(dim) < mesh_ndim and int(dim) not in ring_dims
+        )
+    )
+    return shard_dims
+
+
+def _collective_participants(mesh_shape: Tuple[int, ...], shard_dims: List[int]) -> int:
+    participants = 1
+    for dim in shard_dims:
+        participants *= int(mesh_shape[int(dim)])
+    return participants
+
+
+def _buffer_bytes(buffer) -> float:
+    numel = 1
+    for dim in buffer.get_shape():
+        numel *= int(dim)
+    return float(numel * get_element_size(buffer.dtype))
+
+
+def _layout_allows_async_overlap(reduce_op, overlap_axis: Axis, collective_shard_dims: List[int]) -> bool:
+    if not reduce_op.buffer.has_axis(overlap_axis):
+        return False
+    if reduce_op.buffer.shard_spec is None:
+        return False
+    dim_id, _ = reduce_op.buffer.get_axis(overlap_axis)
+    spec = reduce_op.buffer.shard_spec.specs[dim_id]
+    if not isinstance(spec, tuple):
+        return True
+    overlap_mesh_dims = set(int(dim) for dim in spec[1])
+    return len(overlap_mesh_dims.intersection(set(int(dim) for dim in collective_shard_dims))) == 0
+
+
+def _eligible_async_overlap_axes(program: Program, reduce_op, collective_shard_dims: List[int]) -> List[Axis]:
+    if reduce_op.indices is None:
+        return []
+
+    reduce_axis_names = set(axis.name for axis in reduce_op.axes)
+    seen: set = set()
+    eligible_axes: List[Axis] = []
+    for index in reduce_op.indices:
+        if not isinstance(index, Axis):
+            continue
+        if index.name in reduce_axis_names:
+            continue
+        if index.name in seen:
+            continue
+        seen.add(index.name)
+        tile_count = int(index.size) // int(index.min_block_size)
+        if tile_count < 2:
+            continue
+        if not _layout_allows_async_overlap(reduce_op, index, collective_shard_dims):
+            continue
+        eligible_axes.append(index)
+    return eligible_axes
+
+
+def _async_memory_budget_bytes(program: Program) -> float:
+    budget = getattr(
+        program,
+        "async_collective_memory_budget_bytes",
+        DEFAULT_ASYNC_COLLECTIVE_MEMORY_BUDGET_BYTES,
+    )
+    try:
+        budget_value = float(budget)
+    except (TypeError, ValueError):
+        return float(DEFAULT_ASYNC_COLLECTIVE_MEMORY_BUDGET_BYTES)
+    if budget_value <= 0:
+        return 0.0
+    return budget_value
+
+
+def _annotate_default_collective_strategy(program: Program) -> None:
+    if program.mesh is None:
+        return
+    mesh_ndim = len(program.mesh.shape)
+    for reduce_op in program.visit(collect_reduce):
+        shard_dims = _collective_shard_dims(reduce_op, mesh_ndim)
+        if len(shard_dims) > 0 and len(reduce_op.comm) == 0:
+            reduce_op.managed_collective_strategy = "blocking_collective"
+        elif len(reduce_op.comm) > 0:
+            reduce_op.managed_collective_strategy = "ring_overlap"
+        else:
+            reduce_op.managed_collective_strategy = "blocking_collective"
+        reduce_op.async_collective_overlap_axis = None
+        reduce_op.async_collective_tile_count = 1
+        reduce_op.async_collective_stage_count = 1
+        reduce_op.async_collective_lifecycle = None
+
+
+def _enumerate_collective_strategy_variants(program: Program) -> List[Program]:
+    if program.mesh is None:
+        return [program]
+
+    _annotate_default_collective_strategy(program)
+    variants: List[Program] = [program]
+    mesh_ndim = len(program.mesh.shape)
+    memory_budget_bytes = _async_memory_budget_bytes(program)
+    reduce_ops = program.visit(collect_reduce)
+
+    for reduce_id, reduce_op in enumerate(reduce_ops):
+        shard_dims = _collective_shard_dims(reduce_op, mesh_ndim)
+        if len(shard_dims) == 0:
+            continue
+        participants = _collective_participants(program.mesh.shape, shard_dims)
+        if participants <= 1:
+            continue
+
+        stage_count = DEFAULT_ASYNC_COLLECTIVE_STAGE_COUNT
+        extra_bytes = (stage_count - 1) * _buffer_bytes(reduce_op.buffer)
+        if extra_bytes > memory_budget_bytes:
+            continue
+
+        overlap_axes = _eligible_async_overlap_axes(program, reduce_op, shard_dims)
+        if len(overlap_axes) == 0:
+            continue
+
+        for overlap_axis in overlap_axes:
+            variant = copy.deepcopy(program)
+            variant_axis_map = {
+                axis.name: axis for axis in variant.visit(collect_axis)
+            }
+            variant_reduce = variant.visit(collect_reduce)[reduce_id]
+            variant_overlap_axis = variant_axis_map.get(overlap_axis.name, overlap_axis)
+            variant_reduce.managed_collective_strategy = "async_collective_overlap"
+            variant_reduce.async_collective_overlap_axis = variant_overlap_axis
+            variant_reduce.async_collective_tile_count = (
+                int(variant_overlap_axis.size) // int(variant_overlap_axis.min_block_size)
+            )
+            variant_reduce.async_collective_stage_count = stage_count
+            variant_reduce.async_collective_lifecycle = copy.deepcopy(
+                reduce_op.async_collective_lifecycle
+            )
+            if variant_reduce.async_collective_lifecycle is None:
+                variant_reduce.async_collective_lifecycle = AsyncCollectiveLifecycle()
+            variants.append(variant)
+
+    return variants
+
+
 # def detect_conflict_axis(assign, axes_list, mutex_pair) -> bool:
 #     axes = [axis.name for axes in axes_list for axis in axes]
 #     non_zero_axes = []
@@ -199,7 +360,13 @@ def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int])
 #                 return True
 #     return False
 
-def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: List[str] = list()) -> Iterator[Program]:
+def search(
+    input_program: Program,
+    origin_mesh: DeviceMesh,
+    split_axis_names: List[str] = list(),
+    tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+    program_filter: Optional[Callable[[Program], bool]] = None,
+) -> Iterator[Program]:
     """
     Search for the best schedule for a given program.
 
@@ -215,6 +382,9 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
 
     split_axis_names : List[str]
         The axes can be split to multiple dimensions.
+
+    program_filter : Optional[Callable[[Program], bool]]
+        Additional runtime predicate applied after tensor mapping constraints.
 
     Returns
     -------
@@ -271,6 +441,18 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                 axes_split.append(axis)
 
     assert len(axes_split) == len(split_axis_names), "split axis not found in the program"
+
+    def _set_metadata_and_match(program: Program, mesh: DeviceMesh) -> bool:
+        program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
+        matches_constraints = program_satisfies_tensor_mapping_constraints(
+            program,
+            tensor_mapping_constraints,
+        )
+        if not matches_constraints:
+            return False
+        if program_filter is None:
+            return True
+        return bool(program_filter(program))
 
     for split_num in enumerate_axis_split(axes_split, len(origin_mesh.devices), []):
         # try all possible axis split
@@ -344,8 +526,9 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                 if succ:
                     # print(f"mesh_shape: {mesh_shape}")
                     # print(f"assign: {assign}")
-                    program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
-                    yield program
+                    for variant in _enumerate_collective_strategy_variants(program):
+                        if _set_metadata_and_match(variant, mesh):
+                            yield variant
 
                     # enumerate all subset of ringable axes
                     for i in range(1, len(ringable_axes) + 1): # start from 1, as empty set is the same as above
@@ -362,5 +545,45 @@ def search(input_program: Program, origin_mesh: DeviceMesh, split_axis_names: Li
                                     assert succ == True, "should be able to parallelize as we have checked before"
                                     shift(program, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], 1, usd_axes)
                                     cnt += 1
-                            program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
-                            yield program
+                            for variant in _enumerate_collective_strategy_variants(program):
+                                if _set_metadata_and_match(variant, mesh):
+                                    yield variant
+
+
+def search_with_progress(
+    input_program: Program,
+    origin_mesh: DeviceMesh,
+    split_axis_names: List[str] = list(),
+    tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
+    program_filter: Optional[Callable[[Program], bool]] = None,
+    progress_desc: Optional[str] = None,
+    show_progress: bool = True,
+    miniters: int = 32,
+    mininterval: float = 0.5,
+) -> Iterator[Program]:
+    """Wrap ``search`` with a streaming progress bar for generated candidates.
+
+    The search space size is not known ahead of time, so this progress bar reports
+    the current number of generated candidates and throughput instead of a percentage.
+    """
+    iterator = search(
+        input_program,
+        origin_mesh,
+        split_axis_names,
+        tensor_mapping_constraints,
+        program_filter,
+    )
+    if not show_progress:
+        yield from iterator
+        return
+
+    with tqdm(
+        desc=progress_desc or "search",
+        unit="cand",
+        dynamic_ncols=True,
+        miniters=max(1, miniters),
+        mininterval=mininterval,
+    ) as progress_bar:
+        for program in iterator:
+            progress_bar.update(1)
+            yield program

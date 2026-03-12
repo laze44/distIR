@@ -297,6 +297,8 @@ def _estimate_collective_reduce_events(
     for reduce_op in reduce_ops:
         if len(reduce_op.shard_dim) == 0:
             continue
+        if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") == "async_collective_overlap":
+            continue
 
         ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
         shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
@@ -326,6 +328,62 @@ def _estimate_collective_reduce_events(
         )
 
     return events
+
+
+def _estimate_async_collective_pipeline_overhead_ms(
+    program: Program,
+    hw_config: Dict[str, Any],
+    topology_metadata: Dict[str, List[int]],
+    compute_time_ms: float,
+) -> float:
+    overhead_ms = 0.0
+    reduce_ops = program.visit(collect_reduce)
+    memory_bandwidth = _memory_bandwidth_bytes_per_second(hw_config)
+
+    for reduce_op in reduce_ops:
+        if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") != "async_collective_overlap":
+            continue
+
+        ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
+        shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
+        shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
+        if len(shard_dims) == 0:
+            continue
+
+        participants = 1
+        for mesh_dim in shard_dims:
+            participants *= int(program.mesh.shape[mesh_dim])
+        if participants <= 1:
+            continue
+
+        tile_count = max(1, int(getattr(reduce_op, "async_collective_tile_count", 1)))
+        if tile_count < 2:
+            continue
+        stage_count = max(2, int(getattr(reduce_op, "async_collective_stage_count", 2)))
+
+        data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
+        inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
+        bandwidth, latency_s = _link_params(hw_config, inter_node)
+
+        rounds = 2.0 * (participants - 1.0)
+        transfer_factor = 2.0 * (participants - 1.0) / participants
+        tile_comm_ms = (rounds * latency_s + transfer_factor * (data_bytes / bandwidth)) * 1000.0
+        tile_compute_ms = compute_time_ms / float(tile_count)
+
+        warmup_ms = tile_compute_ms
+        steady_state_ms = float(tile_count - 1) * max(tile_compute_ms, tile_comm_ms)
+        drain_ms = tile_comm_ms
+        pipeline_total_ms = warmup_ms + steady_state_ms + drain_ms
+
+        baseline_compute_ms = float(tile_count) * tile_compute_ms
+        pipeline_overhead_ms = max(0.0, pipeline_total_ms - baseline_compute_ms)
+
+        extra_stage_bytes = float(stage_count - 1) * data_bytes
+        memory_overhead_ms = (extra_stage_bytes / memory_bandwidth) * 1000.0
+
+        overhead_ms += pipeline_overhead_ms + memory_overhead_ms
+
+    return overhead_ms
 
 
 def _estimate_ring_events(
@@ -403,10 +461,17 @@ def estimate_program(
     compute_time_ms = _estimate_compute_time_ms(program, hw_config)
     comm_events = _estimate_collective_reduce_events(program, hw_config, topology_metadata)
     comm_events.extend(_estimate_ring_events(program, hw_config, topology_metadata))
+    async_pipeline_overhead_ms = _estimate_async_collective_pipeline_overhead_ms(
+        program,
+        hw_config,
+        topology_metadata,
+        compute_time_ms,
+    )
 
-    comm_time_ms = sum(event.time_ms for event in comm_events)
+    comm_time_ms = sum(event.time_ms for event in comm_events) + async_pipeline_overhead_ms
     output_buffers = {buffer.tensor for buffer in _collect_unique_buffers(program) if buffer.write}
     total_time_ms = _estimate_total_with_overlap(compute_time_ms, comm_events, output_buffers)
+    total_time_ms += async_pipeline_overhead_ms
 
     return EstimateResult(
         compute_time_ms=compute_time_ms,

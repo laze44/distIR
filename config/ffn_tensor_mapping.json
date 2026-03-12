@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "operators": {
+    "gate": {
+      "matrices": {
+        "A": {
+          "mode": "flexible"
+        },
+        "B": {
+          "mode": "flexible"
+        },
+        "C": {
+          "mode": "flexible"
+        }
+      }
+    },
+    "up": {
+      "matrices": {
+        "A": {
+          "mode": "flexible"
+        },
+        "B": {
+          "mode": "flexible"
+        },
+        "C": {
+          "mode": "flexible"
+        }
+      }
+    },
+    "down": {
+      "matrices": {
+        "A": {
+          "mode": "flexible"
+        },
+        "B": {
+          "mode": "flexible"
+        },
+        "C": {
+          "mode": "flexible"
+        }
+      }
+    }
+  }
+}
