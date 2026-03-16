@@ -485,8 +485,8 @@ def test_cli_mapping_config_summary(tmp_path):
     result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
     text = (result_dir / "summary.txt").read_text(encoding="utf-8")
     assert "config.mapping_config=config/gemm_tensor_mapping_fixed_example.json" in text
-    assert "B: fixed [R, S(intra_node)]" in text
-    assert "C: fixed [S(inter_node), S(intra_node)]" in text
+    assert "B: fixed [S(intra_node), R]" in text
+    assert "C: flexible" in text
 
 
 def test_top_k_must_be_positive(tmp_path):
@@ -500,6 +500,22 @@ def test_top_k_must_be_positive(tmp_path):
             output_dir=str(tmp_path / "results"),
             top_k=0,
             hw_config_path="config/h100.json",
+        )
+
+
+def test_incompatible_fixed_mapping_fails_fast_on_topology(tmp_path):
+    with pytest.raises(ValueError, match="has no shardable intra_node dimension"):
+        search_gemm(
+            m=64,
+            n=64,
+            k=64,
+            inter_node=16,
+            intra_node=1,
+            output_dir=str(tmp_path / "results"),
+            top_k=10,
+            hw_config_path="config/h100.json",
+            mapping_config_path="config/gemm_tensor_mapping_fixed_example.json",
+            show_progress=False,
         )
 
 

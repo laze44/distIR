@@ -173,6 +173,54 @@ def _extract_abc_device_mapping(program) -> Dict[str, Any]:
     return tensor_mapping
 
 
+def _validate_mapping_constraints_topology(
+    constraints,
+    inter_node: int,
+    intra_node: int,
+    mapping_config_path: str,
+) -> None:
+    """Fail fast when fixed shard topology tokens cannot exist on the topology."""
+    topology_capacity = {
+        "inter_node": int(inter_node) > 1,
+        "intra_node": int(intra_node) > 1,
+        "mixed": int(inter_node) > 1 and int(intra_node) > 1,
+    }
+
+    incompatibilities: List[str] = []
+    for matrix_name in ("A", "B", "C"):
+        matrix_constraint = constraints.get(matrix_name)
+        if matrix_constraint.mode != "fixed" or matrix_constraint.mapping is None:
+            continue
+
+        for dim_id, dim_mapping in enumerate(matrix_constraint.mapping):
+            if dim_mapping.is_replicate or dim_mapping.shard_topology is None:
+                continue
+
+            unavailable_tokens = [
+                token for token in dim_mapping.shard_topology if not topology_capacity[token]
+            ]
+            if len(unavailable_tokens) == 0:
+                continue
+
+            missing = ", ".join(unavailable_tokens)
+            incompatibilities.append(
+                f"{matrix_name}[dim {dim_id}] requires {dim_mapping.to_summary()} "
+                f"but topology inter_node={inter_node}, intra_node={intra_node} "
+                f"has no shardable {missing} dimension"
+            )
+
+    if len(incompatibilities) == 0:
+        return
+
+    detail_text = "; ".join(incompatibilities)
+    raise ValueError(
+        f"Tensor mapping config '{mapping_config_path}' is incompatible with the "
+        f"requested topology: {detail_text}. Use '--mapping-config "
+        "config/gemm_tensor_mapping.json' for flexible layouts, or choose a "
+        "topology with positive cardinality for the required shard dimensions."
+    )
+
+
 def search_gemm(
     m: int,
     n: int,
@@ -220,6 +268,12 @@ def search_gemm(
     devices = list(range(world_size))
     mesh = DeviceMesh(devices, (inter_node, intra_node))
     tensor_mapping_constraints = load_tensor_mapping_constraints(mapping_config_path)
+    _validate_mapping_constraints_topology(
+        tensor_mapping_constraints,
+        inter_node,
+        intra_node,
+        mapping_config_path,
+    )
 
     searched_programs = list(
         search_with_progress(
@@ -356,7 +410,7 @@ def main() -> None:
         )
     )
     parser.add_argument("--m", type=int, default=16, help="M dimension (default: 512)")
-    parser.add_argument("--n", type=int, default=2048, help="N dimension (default: 256)")
+    parser.add_argument("--n", type=int, default=4096, help="N dimension (default: 256)")
     parser.add_argument("--k", type=int, default=4096, help="K dimension (default: 1024)")
     parser.add_argument(
         "--inter-node",
@@ -387,7 +441,7 @@ def main() -> None:
     parser.add_argument(
         "--mapping-config",
         type=str,
-        default="config/gemm_tensor_mapping_fixed_example.json",
+        default="config/gemm_tensor_mapping.json",
         help=(
             "Tensor mapping constraint JSON path "
             "(default: config/gemm_tensor_mapping.json)"
