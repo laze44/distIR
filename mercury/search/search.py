@@ -28,7 +28,7 @@ from mercury.search.mapping_constraints import (
 
 MAX_AXIS_TILE_FACTOR = 16
 DEFAULT_ASYNC_COLLECTIVE_STAGE_COUNT = 2
-DEFAULT_ASYNC_COLLECTIVE_MEMORY_BUDGET_BYTES = 80 * (2 ** 30)
+DEFAULT_ASYNC_COLLECTIVE_MEMORY_BUDGET_BYTES = 80 * (2**30)
 
 
 def _linear_to_coords(rank: int, shape: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -41,7 +41,9 @@ def _linear_to_coords(rank: int, shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(coords)
 
 
-def _infer_topology_metadata(origin_mesh: DeviceMesh, mesh: DeviceMesh) -> Dict[str, List[int]]:
+def _infer_topology_metadata(
+    origin_mesh: DeviceMesh, mesh: DeviceMesh
+) -> Dict[str, List[int]]:
     """Infer inter/intra-node mesh dimensions after reshaping."""
     ndim = len(mesh.shape)
     if len(origin_mesh.shape) <= 1:
@@ -90,7 +92,9 @@ def _infer_topology_metadata(origin_mesh: DeviceMesh, mesh: DeviceMesh) -> Dict[
     }
 
 
-def enumerate_mesh_shapes(mesh_size: int, max_dim: int, current_shape: List[int] = None, remaining: int = None) -> Iterator[Tuple[int, ...]]:
+def enumerate_mesh_shapes(
+    mesh_size: int, max_dim: int, current_shape: List[int] = None, remaining: int = None
+) -> Iterator[Tuple[int, ...]]:
     """
     enumerate all possible device mesh shapes.
     Parameters
@@ -111,28 +115,31 @@ def enumerate_mesh_shapes(mesh_size: int, max_dim: int, current_shape: List[int]
     if current_shape is None:
         current_shape = []
         remaining = mesh_size
-    
+
     # base case: if the current shape has reached max_dim but there is still remaining size, return
     if len(current_shape) >= max_dim and remaining > 1:
         return
-        
+
     # if no remaining size to allocate, yield the current shape
     if remaining == 1:
         yield tuple(current_shape)
         return
     elif remaining < 1:
         return
-        
+
     # try all possible factors
     for factor in range(2, remaining + 1):
         if remaining % factor == 0:
             # for each factor, recursively enumerate the remaining size
-            for shape in enumerate_mesh_shapes(mesh_size, max_dim, 
-                                            current_shape + [factor], 
-                                            remaining // factor):
+            for shape in enumerate_mesh_shapes(
+                mesh_size, max_dim, current_shape + [factor], remaining // factor
+            ):
                 yield shape
 
-def enumerate_mesh_assignment(ndim: int, axes_num: int) -> Iterator[List[Tuple[int, int]]]:
+
+def enumerate_mesh_assignment(
+    ndim: int, axes_num: int
+) -> Iterator[List[Tuple[int, int]]]:
     """
     enumerate all possible mesh dimension assignment for a given number of axes and mesh dimensions.
     each axis must be assigned to a continuous range of dimensions, and all dimensions must be assigned.
@@ -152,8 +159,12 @@ def enumerate_mesh_assignment(ndim: int, axes_num: int) -> Iterator[List[Tuple[i
     List[Tuple[int, int]]
         A possible assignment of axes to dimensions, where each tuple represents (start_dim, num_dims)
     """
-    def _recursive_assign(remaining_dims: List[int], axis_idx: int, 
-                         current_assignment: List[Tuple[int, int]]) -> Iterator[List[Tuple[int, int]]]:
+
+    def _recursive_assign(
+        remaining_dims: List[int],
+        axis_idx: int,
+        current_assignment: List[Tuple[int, int]],
+    ) -> Iterator[List[Tuple[int, int]]]:
         # base case: if all axes have been assigned
         if axis_idx == axes_num:
             # only if all dimensions are assigned, it is a valid assignment
@@ -162,26 +173,35 @@ def enumerate_mesh_assignment(ndim: int, axes_num: int) -> Iterator[List[Tuple[i
             return
 
         # try to assign no dimensions to the current axis
-        yield from _recursive_assign(remaining_dims, axis_idx + 1, 
-                                   current_assignment + [(0, 0)])
+        yield from _recursive_assign(
+            remaining_dims, axis_idx + 1, current_assignment + [(0, 0)]
+        )
 
         # try to assign a continuous range of dimensions to the current axis
         for start in range(len(remaining_dims)):
             for length in range(1, len(remaining_dims) - start + 1):
                 # get the dimensions to be assigned
-                assigned_dims = remaining_dims[start:start + length]
+                assigned_dims = remaining_dims[start : start + length]
                 # check if the assigned dimensions are continuous
-                if assigned_dims != list(range(assigned_dims[0], assigned_dims[-1] + 1)):
+                if assigned_dims != list(
+                    range(assigned_dims[0], assigned_dims[-1] + 1)
+                ):
                     continue
 
-                remaining = remaining_dims[:start] + remaining_dims[start + length:]
-                
-                yield from _recursive_assign(remaining, axis_idx + 1,
-                                          current_assignment + [(assigned_dims[0], length)])
+                remaining = remaining_dims[:start] + remaining_dims[start + length :]
+
+                yield from _recursive_assign(
+                    remaining,
+                    axis_idx + 1,
+                    current_assignment + [(assigned_dims[0], length)],
+                )
 
     yield from _recursive_assign(list(range(ndim)), 0, [])
 
-def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int]) -> Iterator[List[int]]:
+
+def enumerate_axis_split(
+    axes: List[Axis], res_cards: int, cur_split: List[int]
+) -> Iterator[List[int]]:
     """Enumerate all valid split factors for target axes.
 
     The split candidates are independent from ``res_cards`` and are constrained by:
@@ -207,7 +227,10 @@ def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int])
 
     max_split_factor = min(MAX_AXIS_TILE_FACTOR, cur_axis.size)
     for factor in range(1, max_split_factor + 1):
-        if cur_axis.size % factor == 0 and cur_axis.size // factor >= cur_axis.min_block_size:
+        if (
+            cur_axis.size % factor == 0
+            and cur_axis.size // factor >= cur_axis.min_block_size
+        ):
             yield from enumerate_axis_split(axes, res_cards, cur_split + [factor])
 
 
@@ -237,7 +260,9 @@ def _buffer_bytes(buffer) -> float:
     return float(numel * get_element_size(buffer.dtype))
 
 
-def _layout_allows_async_overlap(reduce_op, overlap_axis: Axis, collective_shard_dims: List[int]) -> bool:
+def _layout_allows_async_overlap(
+    reduce_op, overlap_axis: Axis, collective_shard_dims: List[int]
+) -> bool:
     if not reduce_op.buffer.has_axis(overlap_axis):
         return False
     if reduce_op.buffer.shard_spec is None:
@@ -247,10 +272,19 @@ def _layout_allows_async_overlap(reduce_op, overlap_axis: Axis, collective_shard
     if not isinstance(spec, tuple):
         return True
     overlap_mesh_dims = set(int(dim) for dim in spec[1])
-    return len(overlap_mesh_dims.intersection(set(int(dim) for dim in collective_shard_dims))) == 0
+    return (
+        len(
+            overlap_mesh_dims.intersection(
+                set(int(dim) for dim in collective_shard_dims)
+            )
+        )
+        == 0
+    )
 
 
-def _eligible_async_overlap_axes(program: Program, reduce_op, collective_shard_dims: List[int]) -> List[Axis]:
+def _eligible_async_overlap_axes(
+    program: Program, reduce_op, collective_shard_dims: List[int]
+) -> List[Axis]:
     if reduce_op.indices is None:
         return []
 
@@ -336,16 +370,14 @@ def _enumerate_collective_strategy_variants(program: Program) -> List[Program]:
 
         for overlap_axis in overlap_axes:
             variant = copy.deepcopy(program)
-            variant_axis_map = {
-                axis.name: axis for axis in variant.visit(collect_axis)
-            }
+            variant_axis_map = {axis.name: axis for axis in variant.visit(collect_axis)}
             variant_reduce = variant.visit(collect_reduce)[reduce_id]
             variant_overlap_axis = variant_axis_map.get(overlap_axis.name, overlap_axis)
             variant_reduce.managed_collective_strategy = "async_collective_overlap"
             variant_reduce.async_collective_overlap_axis = variant_overlap_axis
-            variant_reduce.async_collective_tile_count = (
-                int(variant_overlap_axis.size) // int(variant_overlap_axis.min_block_size)
-            )
+            variant_reduce.async_collective_tile_count = int(
+                variant_overlap_axis.size
+            ) // int(variant_overlap_axis.min_block_size)
             variant_reduce.async_collective_stage_count = stage_count
             variant_reduce.async_collective_lifecycle = copy.deepcopy(
                 reduce_op.async_collective_lifecycle
@@ -363,7 +395,7 @@ def _enumerate_collective_strategy_variants(program: Program) -> List[Program]:
 #     for axis, (start, length) in zip(axes, assign):
 #         if length > 0:
 #             non_zero_axes.append(axis)
-            
+
 #     for axis in non_zero_axes:
 #         if mutex_pair.get(axis) is None:
 #             continue
@@ -372,12 +404,14 @@ def _enumerate_collective_strategy_variants(program: Program) -> List[Program]:
 #                 return True
 #     return False
 
+
 def search(
     input_program: Program,
     origin_mesh: DeviceMesh,
     split_axis_names: List[str] = list(),
     tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
     program_filter: Optional[Callable[[Program], bool]] = None,
+    dedupe_key_fn: Optional[Callable[[Program], object]] = None,
 ) -> Iterator[Program]:
     """
     Search for the best schedule for a given program.
@@ -398,18 +432,29 @@ def search(
     program_filter : Optional[Callable[[Program], bool]]
         Additional runtime predicate applied after tensor mapping constraints.
 
+    dedupe_key_fn : Optional[Callable[[Program], object]]
+        Optional callback that maps a candidate ``Program`` to a canonical
+        pruning key.  When provided, the search keeps only the first candidate
+        whose key has not been seen before.  A ``None`` return from the
+        callback means the candidate is not eligible for deduplication and is
+        always yielded.
+
     Returns
     -------
     Iterator[Program]
         An iterator of programs with different schedules.
     """
 
-    axes_list = input_program.visit(collect_parallelizeable_axes) # list of list of axes, each list coresponds to a GridLoop
+    axes_list = input_program.visit(
+        collect_parallelizeable_axes
+    )  # list of list of axes, each list coresponds to a GridLoop
     # print(f"axes_list: {axes_list}")
     axis_num = sum(len(axes) for axes in axes_list)
     # print(f"axis_num: {axis_num}")
-    
-    max_dim = axis_num + len(split_axis_names) # allow one axis to be assigned to two dimensions, for double ring
+
+    max_dim = axis_num + len(
+        split_axis_names
+    )  # allow one axis to be assigned to two dimensions, for double ring
 
     # the following code is found to be wrong, q and kv can be parallelized together
     # # find the axis pairs that can't be parallelized together
@@ -431,7 +476,7 @@ def search(
     #         for axes in buffer2.bound_axes:
     #             for axis in axes:
     #                 axes2.append(axis.name)
-            
+
     #         # compute common axes
     #         common_axes = set(axes1) & set(axes2)
     #         if len(common_axes) < len(axes1) and len(common_axes) < len(axes2):
@@ -452,7 +497,22 @@ def search(
             if axis.name in split_axis_names:
                 axes_split.append(axis)
 
-    assert len(axes_split) == len(split_axis_names), "split axis not found in the program"
+    assert len(axes_split) == len(split_axis_names), (
+        "split axis not found in the program"
+    )
+
+    seen_keys: set = set()
+
+    def _should_yield(variant: Program) -> bool:
+        if dedupe_key_fn is None:
+            return True
+        key = dedupe_key_fn(variant)
+        if key is None:
+            return True
+        if key in seen_keys:
+            return False
+        seen_keys.add(key)
+        return True
 
     def _set_metadata_and_match(program: Program, mesh: DeviceMesh) -> bool:
         program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
@@ -489,14 +549,13 @@ def search(
 
         for mesh_shape in enumerate_mesh_shapes(len(origin_mesh.devices), max_dim):
             # try all possible mesh shapes
-            
+
             program_shape = copy.deepcopy(splited_program)
             mesh = origin_mesh.reshape(mesh_shape)
 
             init_distributed(program_shape, mesh)
 
             # we need to partition the mesh for each axis
-
 
             for assign in enumerate_mesh_assignment(len(mesh_shape), axis_num):
                 # try all possible assignments
@@ -525,26 +584,48 @@ def search(
                 for loop, axes in zip(loops, axes_list):
                     for axis in axes:
                         usd_axes = set(parallelize_axes)
-                        succ &= parallelize(program, loop, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], usd_axes)
+                        succ &= parallelize(
+                            program,
+                            loop,
+                            axis,
+                            mesh,
+                            assign[cnt][0],
+                            assign[cnt][0] + assign[cnt][1],
+                            usd_axes,
+                        )
                         if not succ:
                             break
                         if assign[cnt][1] != 0:
                             ringable_axes |= axes_names - usd_axes
-                        shift(program, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], 1, usd_axes)
+                        shift(
+                            program,
+                            axis,
+                            mesh,
+                            assign[cnt][0],
+                            assign[cnt][0] + assign[cnt][1],
+                            1,
+                            usd_axes,
+                        )
                         cnt += 1
                     if not succ:
                         break
-                
+
                 if succ:
                     # print(f"mesh_shape: {mesh_shape}")
                     # print(f"assign: {assign}")
                     for variant in _enumerate_collective_strategy_variants(program):
-                        if _set_metadata_and_match(variant, mesh):
+                        if _set_metadata_and_match(variant, mesh) and _should_yield(
+                            variant
+                        ):
                             yield variant
 
                     # enumerate all subset of ringable axes
-                    for i in range(1, len(ringable_axes) + 1): # start from 1, as empty set is the same as above
-                        for ringable_axes_subset in itertools.combinations(ringable_axes, i):
+                    for i in range(
+                        1, len(ringable_axes) + 1
+                    ):  # start from 1, as empty set is the same as above
+                        for ringable_axes_subset in itertools.combinations(
+                            ringable_axes, i
+                        ):
                             program = copy.deepcopy(seed_program)
                             loops = program.visit(collect_loops)
                             axes_list = program.visit(collect_parallelizeable_axes)
@@ -553,12 +634,34 @@ def search(
                                 for axis in axes:
                                     usd_axes = set(ringable_axes_subset)
                                     usd_axes.update(parallelize_axes)
-                                    succ = parallelize(program, loop, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], usd_axes)
-                                    assert succ == True, "should be able to parallelize as we have checked before"
-                                    shift(program, axis, mesh, assign[cnt][0], assign[cnt][0] + assign[cnt][1], 1, usd_axes)
+                                    succ = parallelize(
+                                        program,
+                                        loop,
+                                        axis,
+                                        mesh,
+                                        assign[cnt][0],
+                                        assign[cnt][0] + assign[cnt][1],
+                                        usd_axes,
+                                    )
+                                    assert succ == True, (
+                                        "should be able to parallelize as we have checked before"
+                                    )
+                                    shift(
+                                        program,
+                                        axis,
+                                        mesh,
+                                        assign[cnt][0],
+                                        assign[cnt][0] + assign[cnt][1],
+                                        1,
+                                        usd_axes,
+                                    )
                                     cnt += 1
-                            for variant in _enumerate_collective_strategy_variants(program):
-                                if _set_metadata_and_match(variant, mesh):
+                            for variant in _enumerate_collective_strategy_variants(
+                                program
+                            ):
+                                if _set_metadata_and_match(
+                                    variant, mesh
+                                ) and _should_yield(variant):
                                     yield variant
 
 
@@ -572,11 +675,18 @@ def search_with_progress(
     show_progress: bool = True,
     miniters: int = 32,
     mininterval: float = 0.5,
+    dedupe_key_fn: Optional[Callable[[Program], object]] = None,
 ) -> Iterator[Program]:
     """Wrap ``search`` with a streaming progress bar for generated candidates.
 
     The search space size is not known ahead of time, so this progress bar reports
     the current number of generated candidates and throughput instead of a percentage.
+
+    Args:
+        dedupe_key_fn: Optional callback mapping a candidate ``Program`` to a
+            canonical pruning key.  When provided, ``search`` keeps only the
+            first candidate seen for each key and suppresses later duplicates.
+            Return ``None`` from the callback to leave a candidate unpruned.
     """
     iterator = search(
         input_program,
@@ -584,6 +694,7 @@ def search_with_progress(
         split_axis_names,
         tensor_mapping_constraints,
         program_filter,
+        dedupe_key_fn=dedupe_key_fn,
     )
     if not show_progress:
         yield from iterator

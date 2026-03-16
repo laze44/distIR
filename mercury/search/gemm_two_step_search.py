@@ -11,6 +11,7 @@ from mercury.ir.distributed import DeviceMesh
 from mercury.ir.nodes import Program
 from mercury.ir.utils import get_io_buffers
 from mercury.search.estimate import _default_dtype_key, estimate_program
+from mercury.search.gemm_dedupe import gemm_canonical_dedupe_key
 from mercury.search.mapping_constraints import (
     LogicalBoundaryLayoutSignature,
     LogicalTensorLayoutConstraints,
@@ -94,7 +95,9 @@ def _matrix_buffers(program: Program) -> Dict[str, Any]:
             buffers[matrix_name] = buffer
     for matrix_name in _GEMM_MATRICES:
         if matrix_name not in buffers:
-            raise ValueError(f"Program '{program.name}' missing matrix buffer '{matrix_name}'")
+            raise ValueError(
+                f"Program '{program.name}' missing matrix buffer '{matrix_name}'"
+            )
     return buffers
 
 
@@ -133,12 +136,16 @@ def _fixed_topology_metadata(mesh_shape: Tuple[int, ...]) -> Dict[str, List[int]
         }
     return {
         "inter_node_dims": [0] if int(mesh_shape[0]) > 1 else [],
-        "intra_node_dims": [dim for dim in range(1, len(mesh_shape)) if int(mesh_shape[dim]) > 1],
+        "intra_node_dims": [
+            dim for dim in range(1, len(mesh_shape)) if int(mesh_shape[dim]) > 1
+        ],
         "mixed_dims": [],
     }
 
 
-def _flexible_dim_options(topology_metadata: Dict[str, List[int]]) -> List[Optional[Tuple[int, ...]]]:
+def _flexible_dim_options(
+    topology_metadata: Dict[str, List[int]],
+) -> List[Optional[Tuple[int, ...]]]:
     options: List[Optional[Tuple[int, ...]]] = [None]
     seen = {None}
 
@@ -250,18 +257,18 @@ def _bytes_to_comm_ms(
     intra_bytes: float,
     hw_config: Dict[str, Any],
 ) -> float:
-    inter_bw = _read_positive(hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]) * (
-        10 ** 9
-    )
-    intra_bw = _read_positive(hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]) * (
-        10 ** 9
-    )
-    inter_latency = _read_non_negative(hw_config, ["interconnect", "inter_node", "latency_us"]) / (
-        10 ** 6
-    )
-    intra_latency = _read_non_negative(hw_config, ["interconnect", "intra_node", "latency_us"]) / (
-        10 ** 6
-    )
+    inter_bw = _read_positive(
+        hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]
+    ) * (10**9)
+    intra_bw = _read_positive(
+        hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]
+    ) * (10**9)
+    inter_latency = _read_non_negative(
+        hw_config, ["interconnect", "inter_node", "latency_us"]
+    ) / (10**6)
+    intra_latency = _read_non_negative(
+        hw_config, ["interconnect", "intra_node", "latency_us"]
+    ) / (10**6)
 
     return (
         (inter_bytes / inter_bw)
@@ -325,7 +332,7 @@ def _estimate_step1_cost(
     flops = float(2 * local_m * local_n * local_k)
     dtype_key = _default_dtype_key(hw_config)
     peak_tflops = _read_positive(hw_config, ["compute", "peak_tflops", dtype_key])
-    compute_ms = (flops / (peak_tflops * (10 ** 12))) * 1000.0
+    compute_ms = (flops / (peak_tflops * (10**12))) * 1000.0
 
     input_materialization_bytes = 0.0
     input_inter_bytes = 0.0
@@ -388,14 +395,18 @@ def _estimate_step1_cost(
     output_intra_bytes = 0.0
     if layout_c.shard_specs[0][0] == "R" or layout_c.shard_specs[1][0] == "R":
         output_materialization_bytes = c_total_bytes * 0.25
-        if _dim_uses_topology(layout_c, 0, topology_metadata.get("inter_node_dims", [])) or _dim_uses_topology(
+        if _dim_uses_topology(
+            layout_c, 0, topology_metadata.get("inter_node_dims", [])
+        ) or _dim_uses_topology(
             layout_c, 1, topology_metadata.get("inter_node_dims", [])
         ):
             output_inter_bytes = output_materialization_bytes
         else:
             output_intra_bytes = output_materialization_bytes
 
-    overlapable_comm_ms = _bytes_to_comm_ms(input_inter_bytes, input_intra_bytes, hw_config)
+    overlapable_comm_ms = _bytes_to_comm_ms(
+        input_inter_bytes, input_intra_bytes, hw_config
+    )
     blocking_comm_ms = _bytes_to_comm_ms(
         reduction_inter_bytes + output_inter_bytes,
         reduction_intra_bytes + output_intra_bytes,
@@ -437,7 +448,9 @@ def enumerate_gemm_step1_layout_plans(
     if layout_top_k <= 0:
         raise ValueError("layout_top_k must be a positive integer")
 
-    topology_metadata = _fixed_topology_metadata(tuple(int(dim) for dim in origin_mesh.shape))
+    topology_metadata = _fixed_topology_metadata(
+        tuple(int(dim) for dim in origin_mesh.shape)
+    )
     m_len, n_len, k_len = problem_shape
     constraints = tensor_mapping_constraints or TensorMappingConstraints(matrices={})
 
@@ -464,7 +477,9 @@ def enumerate_gemm_step1_layout_plans(
     )
 
     ranked_plans: List[GEMMLayoutPlan] = []
-    for layout_a, layout_b, layout_c in itertools.product(layouts_a, layouts_b, layouts_c):
+    for layout_a, layout_b, layout_c in itertools.product(
+        layouts_a, layouts_b, layouts_c
+    ):
         seed_plan = GEMMLayoutPlan(
             problem_shape=(m_len, n_len, k_len),
             topology_shape=tuple(int(dim) for dim in origin_mesh.shape),
@@ -495,7 +510,9 @@ def enumerate_gemm_step1_layout_plans(
     if len(ranked_plans) == 0:
         raise ValueError("Failed to enumerate any GEMM logical layout plan")
 
-    ranked_plans.sort(key=lambda plan: (plan.step1_total_time_ms, _plan_order_key(plan)))
+    ranked_plans.sort(
+        key=lambda plan: (plan.step1_total_time_ms, _plan_order_key(plan))
+    )
     return ranked_plans[:layout_top_k]
 
 
@@ -530,6 +547,7 @@ def search_gemm_two_step(
                 show_progress=show_progress,
                 miniters=32,
                 mininterval=0.5,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
             )
         )
     if len(candidate_programs) == 0:
@@ -543,11 +561,15 @@ def search_gemm_two_step(
     unsupported_plan_count = 0
 
     for plan in ranked_plans:
-        logical_constraints = LogicalTensorLayoutConstraints(matrices=plan.boundary_layouts)
+        logical_constraints = LogicalTensorLayoutConstraints(
+            matrices=plan.boundary_layouts
+        )
         matched_candidates = [
             (candidate_idx, program)
             for candidate_idx, program in enumerate(candidate_programs)
-            if program_satisfies_logical_layout_constraints(program, logical_constraints)
+            if program_satisfies_logical_layout_constraints(
+                program, logical_constraints
+            )
         ]
         if len(matched_candidates) == 0:
             unsupported_plan_count += 1
@@ -566,7 +588,9 @@ def search_gemm_two_step(
             )
         ranked_candidates.sort(key=lambda item: (item[0], item[1]))
         best_candidate = ranked_candidates[0]
-        plan_step2_costs_ms[" | ".join(_plan_order_key(plan))] = float(best_candidate[0])
+        plan_step2_costs_ms[" | ".join(_plan_order_key(plan))] = float(
+            best_candidate[0]
+        )
 
         if float(best_candidate[0]) >= best_total:
             continue

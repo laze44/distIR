@@ -14,6 +14,7 @@ from .ffn_two_step_search import (
     FFNTwoStepSearchResult,
     search_ffn_two_step,
 )
+from .gemm_dedupe import gemm_canonical_dedupe_key
 from .gemm_two_step_search import (
     GEMMLayoutPlan,
     GEMMTwoStepSearchResult,

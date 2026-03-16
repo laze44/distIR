@@ -3,6 +3,7 @@
 results/
 .github
 AGENTS.md
+CLAUDE.md
 specs
 .vscode
 .specify

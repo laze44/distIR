@@ -18,6 +18,7 @@ from mercury.ir.loop_eliminating import eliminate_loops
 from mercury.ir.utils import get_io_buffers
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
+from mercury.search.gemm_dedupe import gemm_canonical_dedupe_key
 from mercury.search.mapping_constraints import load_tensor_mapping_constraints
 from mercury.search.search import search_with_progress
 
@@ -33,7 +34,9 @@ def _extract_template_from_file(template_name: str) -> str:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == template_name:
-                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    if isinstance(node.value, ast.Constant) and isinstance(
+                        node.value.value, str
+                    ):
                         return node.value.value
     raise ValueError(f"Cannot find template '{template_name}' in {file_path}")
 
@@ -43,6 +46,7 @@ def _load_gemm_template() -> str:
     template_name = "gemm_manage_reduction"
     try:
         from utils.gemm_dsl import gemm_manage_reduction
+
         return gemm_manage_reduction
     except (ModuleNotFoundError, ImportError):
         return _extract_template_from_file(template_name)
@@ -52,12 +56,16 @@ def _format_gemm_source(m: int, n: int, k: int) -> str:
     """Format the GEMM template with validated block sizes."""
     try:
         from utils.gemm_dsl import format_gemm_template
+
         return format_gemm_template(m, n, k)
     except (ModuleNotFoundError, ImportError):
         from utils.gemm_dsl import gemm_block_size
+
         template = _load_gemm_template()
         return template.format(
-            M_LEN=m, N_LEN=n, K_LEN=k,
+            M_LEN=m,
+            N_LEN=n,
+            K_LEN=k,
             M_BLOCK=gemm_block_size(m),
             N_BLOCK=gemm_block_size(n),
             K_BLOCK=gemm_block_size(k),
@@ -103,7 +111,10 @@ def _extract_abc_device_mapping(program) -> Dict[str, Any]:
         return {}
 
     mesh = program.mesh
-    device_coords = {int(mesh.get_device(coords)): tuple(int(v) for v in coords) for coords in mesh.all_coords()}
+    device_coords = {
+        int(mesh.get_device(coords)): tuple(int(v) for v in coords)
+        for coords in mesh.all_coords()
+    }
 
     tensor_mapping: Dict[str, Any] = {}
     for tensor_name in ("a", "b", "c"):
@@ -197,7 +208,9 @@ def _validate_mapping_constraints_topology(
                 continue
 
             unavailable_tokens = [
-                token for token in dim_mapping.shard_topology if not topology_capacity[token]
+                token
+                for token in dim_mapping.shard_topology
+                if not topology_capacity[token]
             ]
             if len(unavailable_tokens) == 0:
                 continue
@@ -285,6 +298,7 @@ def search_gemm(
             show_progress=show_progress,
             miniters=32,
             mininterval=0.5,
+            dedupe_key_fn=gemm_canonical_dedupe_key,
         )
     )
     # Sort for deterministic ordering (same approach as test_search_gemm.py)
@@ -322,21 +336,23 @@ def search_gemm(
         "",
     ]
 
-    summary_lines.extend([
-        "Summary Metadata (migrated from summary.json):",
-        f"  config.m={m}",
-        f"  config.n={n}",
-        f"  config.k={k}",
-        f"  config.inter_node={inter_node}",
-        f"  config.intra_node={intra_node}",
-        f"  config.world_size={world_size}",
-        f"  config.hardware={hw_config['name']}",
-        f"  config.top_k={top_k}",
-        f"  config.mapping_config={mapping_config_path}",
-        f"  total_searched={len(searched_programs)}",
-        "",
-        "Tensor Mapping Constraints:",
-    ])
+    summary_lines.extend(
+        [
+            "Summary Metadata (migrated from summary.json):",
+            f"  config.m={m}",
+            f"  config.n={n}",
+            f"  config.k={k}",
+            f"  config.inter_node={inter_node}",
+            f"  config.intra_node={intra_node}",
+            f"  config.world_size={world_size}",
+            f"  config.hardware={hw_config['name']}",
+            f"  config.top_k={top_k}",
+            f"  config.mapping_config={mapping_config_path}",
+            f"  total_searched={len(searched_programs)}",
+            "",
+            "Tensor Mapping Constraints:",
+        ]
+    )
 
     for tensor_name, summary in tensor_mapping_constraints.summary_by_matrix().items():
         summary_lines.append(f"  {tensor_name}: {summary}")
@@ -358,8 +374,12 @@ def search_gemm(
         summary_lines.append(f"  Code: {code_filename}")
         summary_lines.append(f"  IR:   {ir_filename}")
         summary_lines.append(f"  JSON rank field: {idx + 1}")
-        summary_lines.append(f"  Estimated compute time: {estimate.compute_time_ms:.6f} ms")
-        summary_lines.append(f"  Estimated communication time: {estimate.comm_time_ms:.6f} ms")
+        summary_lines.append(
+            f"  Estimated compute time: {estimate.compute_time_ms:.6f} ms"
+        )
+        summary_lines.append(
+            f"  Estimated communication time: {estimate.comm_time_ms:.6f} ms"
+        )
         summary_lines.append(f"  Estimated total time: {estimate.total_time_ms:.6f} ms")
         if len(tensor_device_mapping) > 0:
             summary_lines.append("  Tensor Mapping (A/B/C on each device):")
@@ -410,8 +430,12 @@ def main() -> None:
         )
     )
     parser.add_argument("--m", type=int, default=16, help="M dimension (default: 512)")
-    parser.add_argument("--n", type=int, default=4096, help="N dimension (default: 256)")
-    parser.add_argument("--k", type=int, default=4096, help="K dimension (default: 1024)")
+    parser.add_argument(
+        "--n", type=int, default=4096, help="N dimension (default: 256)"
+    )
+    parser.add_argument(
+        "--k", type=int, default=4096, help="K dimension (default: 1024)"
+    )
     parser.add_argument(
         "--inter-node",
         type=int,
@@ -424,8 +448,12 @@ def main() -> None:
         default=4,
         help="Intra-node mesh dimension (default: 2)",
     )
-    parser.add_argument("--output-dir", type=str, default="results",
-                        help="Output directory for results (default: results)")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results",
+        help="Output directory for results (default: results)",
+    )
     parser.add_argument(
         "--top-k",
         type=int,
