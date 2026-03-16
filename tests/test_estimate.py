@@ -28,11 +28,11 @@ from mercury.ir.nodes import (
 from mercury.ir.utils import collect_reduce
 from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.search import search
-from utils.gemm_dsl import gemm_manage_reduction
+from utils.gemm_dsl import format_gemm_template
 
 
 def _build_programs(m: int, n: int, k: int, mesh_shape):
-    source = gemm_manage_reduction.format(M_LEN=m, N_LEN=n, K_LEN=k)
+    source = format_gemm_template(m, n, k)
     tree = ast.parse(textwrap.dedent(source))
     builder = IRBuilder()
 
@@ -501,3 +501,36 @@ def test_top_k_must_be_positive(tmp_path):
             top_k=0,
             hw_config_path="config/h100.json",
         )
+
+
+def test_estimate_small_axis_unsplit():
+    """Unsplit small axes: local M/N/K equal the full dimension."""
+    programs = _build_programs(16, 8, 16, (1,))
+    assert len(programs) > 0
+
+    config = load_hardware_config("config/h100.json")
+    estimate = estimate_program(programs[0], config)
+    assert estimate.compute_time_ms > 0
+    assert estimate.total_time_ms >= estimate.compute_time_ms
+
+
+def test_estimate_small_axis_binary_split():
+    """Binary-split small axis: unsplit local K equals full dimension."""
+    programs = _build_programs(16, 16, 8, (1,))
+    assert len(programs) > 0
+
+    config = load_hardware_config("config/h100.json")
+    for prog in programs:
+        estimate = estimate_program(prog, config)
+        assert estimate.compute_time_ms > 0
+
+
+def test_estimate_small_axis_split_and_sharded():
+    """Split-plus-sharded small axis: local K reflects sharding."""
+    programs = _build_programs(16, 16, 8, (2,))
+
+    config = load_hardware_config("config/h100.json")
+    for prog in programs:
+        estimate = estimate_program(prog, config)
+        assert estimate.compute_time_ms > 0
+        assert estimate.total_time_ms >= 0

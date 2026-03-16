@@ -9,11 +9,11 @@ from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
 from mercury.ir.utils import collect_reduce
 from mercury.search.search import search
-from utils.gemm_dsl import gemm_manage_reduction
+from utils.gemm_dsl import format_gemm_template
 
 
 def _build_gemm_program(m_len: int = 64, n_len: int = 128, k_len: int = 64):
-    source = gemm_manage_reduction.format(M_LEN=m_len, N_LEN=n_len, K_LEN=k_len)
+    source = format_gemm_template(m_len, n_len, k_len)
     tree = ast.parse(textwrap.dedent(source))
     builder = IRBuilder()
     for node in ast.walk(tree):

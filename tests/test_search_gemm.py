@@ -179,10 +179,6 @@ def run_validation(source):
 
 if __name__ == "__main__":
     dist.init_process_group("nccl")
-    source = gemm_manage_reduction.format(
-        M_LEN = m,
-        N_LEN = n,
-        K_LEN = k,
-    )
+    source = format_gemm_template(m, n, k)
     run_validation(source)
     

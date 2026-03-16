@@ -48,6 +48,22 @@ def _load_gemm_template() -> str:
         return _extract_template_from_file(template_name)
 
 
+def _format_gemm_source(m: int, n: int, k: int) -> str:
+    """Format the GEMM template with validated block sizes."""
+    try:
+        from utils.gemm_dsl import format_gemm_template
+        return format_gemm_template(m, n, k)
+    except (ModuleNotFoundError, ImportError):
+        from utils.gemm_dsl import gemm_block_size
+        template = _load_gemm_template()
+        return template.format(
+            M_LEN=m, N_LEN=n, K_LEN=k,
+            M_BLOCK=gemm_block_size(m),
+            N_BLOCK=gemm_block_size(n),
+            K_BLOCK=gemm_block_size(k),
+        )
+
+
 def _capture_dump(program) -> str:
     """Capture the output of dump() as a string."""
     buf = io.StringIO()
@@ -189,8 +205,7 @@ def search_gemm(
 
     world_size = inter_node * intra_node
 
-    gemm_template = _load_gemm_template()
-    source = gemm_template.format(M_LEN=m, N_LEN=n, K_LEN=k)
+    source = _format_gemm_source(m, n, k)
 
     tree = ast.parse(textwrap.dedent(source))
     builder = IRBuilder()
@@ -340,7 +355,7 @@ def main() -> None:
             "IR + PyTorch code."
         )
     )
-    parser.add_argument("--m", type=int, default=32, help="M dimension (default: 512)")
+    parser.add_argument("--m", type=int, default=16, help="M dimension (default: 512)")
     parser.add_argument("--n", type=int, default=2048, help="N dimension (default: 256)")
     parser.add_argument("--k", type=int, default=4096, help="K dimension (default: 1024)")
     parser.add_argument(

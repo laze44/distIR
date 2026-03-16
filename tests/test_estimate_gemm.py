@@ -105,11 +105,7 @@ def rs_tp(world_size, m=m, n=n, k=k) -> Tuple[List[Buffer], List[Buffer]]:
 
 
 def test_search(world_size, get_origin_io):
-    source = gemm_manage_reduction.format(
-        M_LEN=m,
-        N_LEN=n,
-        K_LEN=k,
-    )
+    source = format_gemm_template(m, n, k)
     rank = dist.get_rank()
 
     devices = [i for i in range(world_size)]

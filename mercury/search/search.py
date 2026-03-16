@@ -186,12 +186,24 @@ def enumerate_axis_split(axes: List[Axis], res_cards: int, cur_split: List[int])
 
     The split candidates are independent from ``res_cards`` and are constrained by:
     1) exact divisibility, 2) minimum block size, and 3) a maximum tile-factor cap.
+
+    For GEMM small axes (size < 32 and min_block_size == size), only factor 1
+    (unsplit) and factor 2 (one binary split, if even) are allowed.
     """
     if len(cur_split) == len(axes):
         yield copy.deepcopy(cur_split)
         return
-    
+
     cur_axis = axes[len(cur_split)]
+
+    # GEMM small-axis path: whole-axis tile with at most one binary split
+    if cur_axis.size < 32 and cur_axis.min_block_size == cur_axis.size:
+        # Always allow unsplit
+        yield from enumerate_axis_split(axes, res_cards, cur_split + [1])
+        # Allow one binary split only for even dimensions
+        if cur_axis.size % 2 == 0 and cur_axis.size >= 2:
+            yield from enumerate_axis_split(axes, res_cards, cur_split + [2])
+        return
 
     max_split_factor = min(MAX_AXIS_TILE_FACTOR, cur_axis.size)
     for factor in range(1, max_split_factor + 1):

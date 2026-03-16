@@ -17,6 +17,8 @@ _DTYPE_TO_CONFIG_KEY: Dict[torch.dtype, str] = {
     torch.bfloat16: "bf16",
     torch.float16: "fp16",
     torch.float32: "fp32",
+    torch.float8_e4m3fn: "fp8",
+    torch.float8_e5m2: "fp8",
 }
 
 
@@ -71,18 +73,22 @@ def _read_non_negative(config: Dict[str, Any], path: Sequence[str]) -> float:
     return float(value)
 
 
+_KNOWN_DTYPE_KEYS = {"bf16", "fp16", "fp32", "tf32", "fp8"}
+
+
 def _validate_hardware_config(config: Dict[str, Any]) -> None:
     name = _get_required(config, ["name"])
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Config field must be a non-empty string: name")
 
-    _read_positive(config, ["compute", "peak_tflops", "bf16"])
-    _read_positive(config, ["compute", "peak_tflops", "fp16"])
-    _read_positive(config, ["compute", "peak_tflops", "fp32"])
+    peak_tflops = _get_required(config, ["compute", "peak_tflops"])
+    if not isinstance(peak_tflops, dict) or not peak_tflops:
+        raise ValueError("compute.peak_tflops must be a non-empty mapping")
 
-    peak_tflops = config["compute"]["peak_tflops"]
-    if "tf32" in peak_tflops:
-        _read_positive(config, ["compute", "peak_tflops", "tf32"])
+    for key in peak_tflops:
+        if key not in _KNOWN_DTYPE_KEYS:
+            raise ValueError(f"Unknown dtype key in peak_tflops: {key}")
+        _read_positive(config, ["compute", "peak_tflops", key])
 
     _read_positive(config, ["memory", "bandwidth_tb_per_s"])
     if "capacity_gb" in config.get("memory", {}):
@@ -151,14 +157,14 @@ def _extract_local_mnk(program: Program) -> List[int]:
             continue
         k_local = 1
         for axis in reduce_op.axes:
-            k_local *= int(axis.min_block_size)
+            k_local *= int(axis.size)
         break
 
     if k_local is None:
         all_axes = program.visit(collect_axis)
         for axis in all_axes:
             if axis.name.upper().startswith("K"):
-                k_local = int(axis.min_block_size)
+                k_local = int(axis.size)
                 break
 
     if k_local is None:
@@ -167,8 +173,19 @@ def _extract_local_mnk(program: Program) -> List[int]:
     return [m_local, n_local, k_local]
 
 
+def _default_dtype_key(hw_config: Dict[str, Any]) -> str:
+    """Return the first available dtype key from the hardware config."""
+    peak_tflops = hw_config["compute"]["peak_tflops"]
+    for key in ("bf16", "fp16", "fp8", "fp32", "tf32"):
+        if key in peak_tflops:
+            return key
+    raise ValueError("No supported dtype found in compute.peak_tflops")
+
+
 def _peak_flops_per_second(hw_config: Dict[str, Any], dtype: torch.dtype) -> float:
-    dtype_key = _DTYPE_TO_CONFIG_KEY.get(dtype, "bf16")
+    dtype_key = _DTYPE_TO_CONFIG_KEY.get(dtype)
+    if dtype_key is None or dtype_key not in hw_config["compute"]["peak_tflops"]:
+        dtype_key = _default_dtype_key(hw_config)
     peak_tflops = _read_positive(hw_config, ["compute", "peak_tflops", dtype_key])
     return peak_tflops * (10 ** 12)
 

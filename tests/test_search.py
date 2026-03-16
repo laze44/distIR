@@ -124,11 +124,7 @@ def test_search_attn_reduce():
 
 def test_search_gemm():
     m, n, k = 1024, 4096, 512
-    source = gemm_manage_reduction.format(
-        M_LEN = m,
-        N_LEN = n,
-        K_LEN = k,
-    )
+    source = format_gemm_template(m, n, k)
 
     tree = ast.parse(textwrap.dedent(source))
     builder = IRBuilder()

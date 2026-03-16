@@ -27,11 +27,11 @@ from mercury.search.mapping_constraints import (
     program_satisfies_tensor_mapping_constraints,
 )
 from mercury.search.search import search
-from utils.gemm_dsl import gemm_manage_reduction
+from utils.gemm_dsl import format_gemm_template
 
 
 def _build_gemm_program(m: int = 128, n: int = 128, k: int = 128):
-    source = gemm_manage_reduction.format(M_LEN=m, N_LEN=n, K_LEN=k)
+    source = format_gemm_template(m, n, k)
     tree = ast.parse(textwrap.dedent(source))
     builder = IRBuilder()
 

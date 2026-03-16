@@ -10,7 +10,7 @@ from mercury.backend import generate_pytorch_code
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.nodes import Program
 from mercury.ir.utils import get_io_buffers
-from mercury.search.estimate import estimate_program
+from mercury.search.estimate import _default_dtype_key, estimate_program
 from mercury.search.mapping_constraints import (
     LogicalBoundaryLayoutSignature,
     LogicalTensorLayoutConstraints,
@@ -323,7 +323,8 @@ def _estimate_step1_cost(
     local_n = int(local_c[1])
     local_k = int(min(local_a[1], local_b[0]))
     flops = float(2 * local_m * local_n * local_k)
-    peak_tflops = _read_positive(hw_config, ["compute", "peak_tflops", "bf16"])
+    dtype_key = _default_dtype_key(hw_config)
+    peak_tflops = _read_positive(hw_config, ["compute", "peak_tflops", dtype_key])
     compute_ms = (flops / (peak_tflops * (10 ** 12))) * 1000.0
 
     input_materialization_bytes = 0.0
