@@ -5,7 +5,7 @@
 本文定义一个分两阶段执行的搜索策略：
 
 1. `step-1` 搜索计算图级别的 tensor layout plan；
-2. `step-2` 在给定 layout plan 下搜索每个算子的 distributed kernel lowering。
+2. `step-2` 在给定 layout plan 下搜索每个算子或 segment 的 distributed kernel lowering，并决定 explicit edge reshard 如何被 materialize 或融合。
 
 这里的 `layout` 指张量在 `DeviceMesh` 上的分布方式，包括：
 
@@ -19,7 +19,7 @@ FFN 示例使用如下逻辑图：
 本文采用以下约定：
 
 - `step-1` 搜索的是 tensor layout plan，其中既包括 activation layout，也包括每个算子 weight tensor 的 layout。
-- `step-2` 负责在给定 layout plan 下搜索算子内部 lowering。
+- `step-2` 负责在给定 layout plan 下搜索算子或 segment 内部 lowering，并决定 explicit edge reshard 的归属方式。
 - 若一期实现只搜索 3 个 GEMM kernel，需要明确假设 `silu_and_mul` 已经被融合，不作为独立 kernel 搜索。
 - 若 `silu_and_mul` 没有被融合，它必须作为独立 graph node 进入 `step-1` 和 `step-2`。
 - 若 FFN 不是搜索边界，`Y` 的 layout 需要由外层图固定，或者显式纳入 `step-1` 的状态。
@@ -88,7 +88,16 @@ FFN 示例使用如下逻辑图：
 
 ### 4. step-1 与 step-2 的通信职责划分
 
-`step-1` 只负责决定 kernel 边界上的 tensor layout，不负责决定具体通信实现。
+`step-1` 只负责决定逻辑边界上的 tensor layout obligation，不负责决定这些 obligation 在运行时如何被 materialize。
+
+这里引入两个概念：
+
+- `logical boundary`
+  - 由 `step-1` 决定的图语义边界
+  - 描述某条图边或某个算子输入/输出在语义上必须满足的 layout
+- `materialized kernel boundary`
+  - 由 `step-2` 决定的实际 kernel/segment 接口
+  - 描述运行时在哪些位置真正落成独立 buffer、独立 kernel 边界或独立通信段
 
 对任意一条图边：
 
@@ -97,18 +106,28 @@ FFN 示例使用如下逻辑图：
 
 因此，`step-1` 的职责是判断：
 
-- kernel 的边界 layout 是什么
-- 图边上是否还需要独立的 reshard
+- logical boundary layout 是什么
+- 图边上是否存在 explicit edge reshard obligation
 
 `step-2` 的职责是：
 
-- 在固定输入/输出 layout 的前提下，决定算子内部如何通信
+- 在固定 logical boundary layout obligation 的前提下，决定算子或 segment 内部如何通信
+- 决定 explicit edge reshard obligation 是：
+  - 保留为独立 reshard segment；
+  - 融合进 producer-side epilogue；
+  - 融合进 consumer-side prologue 或更大的 consumer-side segment
 - 决定是否存在更优的 collective rewrite 或更优的通信排布
 
 例如：
 
-- 若 `gate/up` 的输出 `L_mid` 与 `down` 的输入 `L_mid` 一致，则 `step-2` 中不需要再处理独立的 edge reshard
+- 若 `gate/up` 的输出 `L_mid` 与 `down` 的逻辑输入一致，则 `step-2` 中不需要再处理独立的 edge reshard
+- 若 `L_mid` 与 `down.A` 不一致，则 `step-1` 只暴露一个 explicit edge reshard obligation；该 obligation 在 `step-2` 中既可以保留为独立 segment，也可以被融合进 consumer-side segment
 - `gate` 或 `up` 内部究竟采用 all-reduce、reduce-scatter、ring exchange 还是其他等价实现，由 `step-2` 决定
+
+需要强调：
+
+- `step-2` 不允许随意改写 `step-1` 的 logical layout plan；
+- `step-2` 允许改变的是 obligation 在哪个 segment 内被满足，以及哪些 boundary 真正 materialize。
 
 ### 5. step-1 的代价模型
 
@@ -215,89 +234,166 @@ FFN 示例使用如下逻辑图：
 
 - `gate`: `L_in + W_gate -> L_mid`
 - `up`: `L_in + W_up -> L_mid`
-- `down`: `L_mid + W_down -> L_out`
+- `down`: `down.A + W_down -> L_out`
+- `edge obligation`: `L_mid -> down.A`
 
-`step-2` 的目标是在这些边界 layout 已固定的前提下，搜索每个算子的 lowering 方式，包括：
+`step-2` 的目标是在这些 logical boundary obligation 已固定的前提下，搜索每个算子或 segment 的 lowering 方式，包括：
 
 - loop tiling / split
 - loop order
 - mesh reshape 与 mesh-dim assignment
 - ring / collective 的具体插入方式
 - 通信放置在 load/store/reduce/epilogue 的位置
+- explicit edge reshard obligation 由哪个 segment 持有
+- 哪些 logical boundary 需要 materialize 为实际 kernel 边界
 
 在该阶段中：
 
-- 若相邻 kernel 的边界 layout 一致，则忽略独立的 edge reshard，把问题视为单纯的 distributed kernel 优化；
-- 若边界 layout 不一致，则对应的 edge reshard 作为图级固定代价保留，不属于单 kernel 内部优化对象。
+- 若相邻 logical boundary 一致，则不存在 explicit edge reshard obligation，把问题视为单纯的 distributed kernel 优化；
+- 若 logical boundary 不一致，则对应的 explicit edge reshard obligation 必须在 `step-2` 中被显式处理；它可以保留为独立 segment，也可以被融合进相邻 segment，但不能被忽略。
 
 ### 2. kernel 边界
 
-kernel 边界由 lowering/fusion 策略决定，不必与前端图中的算子数一一对应：
+materialized kernel 边界由 lowering/fusion 策略决定，不必与前端图中的算子数一一对应：
 
 - 一个前端算子可以被拆成多个 kernel；
 - 多个前端算子也可以被融合成一个 kernel。
 
-在 FFN 示例里，只有在明确采用以下约束时，才将一期问题写成 3 个 kernel：
+因此，`step-1` 固定的是 logical boundary，而不是最终 materialized kernel 边界。`step-2` 可以在不破坏 logical boundary obligation 的前提下改变 segment 划分。
+
+### 2.1 layout-preserving chain
+
+若一个 operator chain 满足以下条件，则称其为 `layout-preserving chain`：
+
+- chain 内部各节点不引入新的全局分布语义约束；
+- chain 的 logical output layout 可以用与 logical input layout 相同的 layout 表达；
+- chain 不要求在中间点对外 materialize 独立 tensor layout。
+
+典型例子是逐元素 chain，例如：
+
+- `silu`
+- `mul`
+- `bias`
+- `scale`
+
+在 FFN 示例里，若 `silu_and_mul` 不单独作为搜索边界，它可被视为一个 layout-preserving chain。
+
+### 2.2 segment 级 edge 融合
+
+对一条 explicit edge reshard obligation，`step-2` 允许搜索以下 lowering 归属：
+
+- `separate edge segment`
+  - reshard 作为独立 segment 存在
+- `producer-side fusion`
+  - reshard 融入上游 segment 的 epilogue
+- `consumer-side fusion`
+  - reshard 融入下游 segment 的 prologue
+- `layout-preserving chain + edge + consumer`
+  - 若 edge 前存在 layout-preserving chain，则可把该 chain、edge 和 consumer 合并成一个更大的 segment
+
+其中最后一种形式是一期推荐重点支持的融合单位，因为它通常能避免把共享中间张量的 reshard 重复放到多个 producer 上。
+
+### 2.3 FFN 的推荐融合方式
+
+对 FFN：
+
+`X -> {gate_gemm, up_gemm} -> silu_and_mul -> down_gemm -> Y`
+
+若 `L_mid != down.A`，推荐的最小融合单位为：
+
+- `silu_and_mul + edge(L_mid -> down.A) + down_gemm`
+
+即 consumer-side segment 形如：
+
+- logical inputs: 两个 `L_mid`
+- internal chain: `silu_and_mul`
+- internal edge obligation: `L_mid -> down.A`
+- consumer kernel: `down_gemm`
+- logical output: `L_out`
+
+在这种情况下：
+
+- `gate.C` 和 `up.C` 的 logical output 仍然是 `L_mid`
+- `step-2` 不把 `gate/up` 的 logical output 改写为 `down.A`
+- 被改变的是 reshard obligation 的 segment ownership，而不是 `step-1` 的 logical layout 定义
+
+在 FFN 示例里，只有在明确采用以下约束时，才将一期问题写成 3 个逻辑 kernel：
 
 - `gate_gemm`
 - `up_gemm`
 - `down_gemm`
 
-同时默认 `silu_and_mul` 已经融合到相邻 kernel，或者当前版本暂不搜索该段。
+同时默认 `silu_and_mul` 已经融合到相邻 segment，或者当前版本暂不搜索该段。
 
 ### 3. kernel 内通信与输出 layout
 
-每个 kernel 必须产出 `step-1` 指定的输出 layout。为满足该 layout，kernel 内可能：
+每个 segment 必须满足其持有的 logical boundary obligation。为满足这些 obligation，segment 内可能：
 
 - 需要插入通信；
 - 不需要通信；
 - 在 reduction 过程中边算边通信；
 - 在 load 阶段执行 ring exchange；
-- 在 epilogue 阶段执行 collective。
+- 在 epilogue 阶段执行 collective；
+- 在 chain 与 consumer 之间执行 fused reshard；
+- 只在 segment 内部完成某个 layout obligation，而不将其 materialize 为独立图边 buffer。
 
-`step-2` 不改变 `step-1` 已经固定的输入/输出 layout，只优化“如何到达该 layout”。
+`step-2` 不改变 `step-1` 已经固定的 logical input/output layout obligation，只优化“这些 obligation 在哪个 segment 中、以什么方式被满足”。
 
 ### 4. step-2 的时间估计
 
-kernel 级时间模型写成：
+segment 级时间模型写成：
 
-`T_kernel = T_compute + T_comm - T_overlap_in_kernel`
+`T_segment = T_compute + T_comm - T_overlap_in_segment`
 
-其中 `T_overlap_in_kernel` 只覆盖：
+其中 `T_overlap_in_segment` 只覆盖：
 
 - 在具体 IR 中已经显式表达的 overlap
 - 运行时可实现的 overlap
 
-跨 kernel overlap 不在该公式中建模，应在图级调度模型里单独定义。
+跨 segment overlap 不在该公式中建模，应在图级调度模型里单独定义。
 
 在本项目默认执行模型下，图级调度模型仍然遵循“每个 device 上算子顺序执行”的原则，因此不引入多 compute stream 并发；可建模的 overlap 仅包括：
 
-- 同一 kernel 内的 `compute-communication overlap`
+- 同一 segment 内的 `compute-communication overlap`
 - 相邻阶段中可实现的 communication 重排或融合
+
+若 explicit edge reshard 被融合进某个 segment，则：
+
+- 该 edge 不再单独形成 `T_edge`
+- 它的时间应并入对应的 `T_segment`
+- 但该 edge obligation 仍然保留在 step-1 plan 的语义定义中，便于对不同 lowering ownership 做一致比较
 
 ### 5. step-2 的输出
 
 `step-2` 最终输出：
 
 - 每个 operator/segment 的最佳 lowering IR
-- 对应的 kernel 时间估计
+- 每个 explicit edge reshard obligation 的最终 lowering ownership
+- 对应的 segment 时间估计
 - 若存在多个 `step-1` plan，则输出全局重排后的最佳 plan
 
 整个两阶段流程为：
 
 1. 搜索 top-k tensor layout plan；
-2. 在每个 layout plan 下搜索 operator lowering；
+2. 在每个 layout plan 下搜索 operator/segment lowering，并为 explicit edge reshard obligation 分配 lowering ownership；
 3. 重新评估图级总时间并选出最终方案。
 
 ## 建议采用的一期简化版本
 
 如果先做一个可落地的一期版本，建议采用以下边界：
 
-- 只搜索 FFN 的 3 个 GEMM；
-- 默认 `silu_and_mul` 已融合或忽略；
+- `step-1` 仍只搜索 FFN 的 3 个 GEMM 边界；
+- `silu_and_mul` 作为 step-2 中可参与 consumer-side 融合的 layout-preserving chain，不单独成为一期搜索边界；
 - 每个 device 上算子按顺序执行，只允许 `compute-communication` 多 stream 并发；
 - `step-1` 同时搜索 `L_in`、`L_mid`、`L_out` 以及 `W_gate`、`W_up`、`W_down`；
 - `step-1` 输出 top-k layout plan，而不是单一最优解；
-- `step-2` 只在给定边界 layout 下搜索算子内部 lowering；
-- `step-1` 只决定边界 layout 与是否存在独立 edge reshard；
-- `step-2` 在固定边界 layout 下优化算子内部通信实现。
+- `step-1` 只决定 logical boundary layout 与是否存在 explicit edge reshard obligation；
+- `step-2` 在固定 logical boundary layout 下搜索 operator/segment lowering；
+- `step-2` 一期重点支持将 `L_mid -> down.A` 融合进 `silu_and_mul + down` 的 consumer-side segment；
+- `step-2` 不允许改写 `gate/up` 的 logical output `L_mid`，只允许改变 reshard obligation 在哪个 segment 中被满足。
+
+### 6. 结果导出约定（实现同步）
+
+- canonical 导出结果必须来自最终选中的 `step-2` segment/program，而不是每个算子各自独立排序后的 rank-1 候选；
+- per-operator top-k 候选文件仅作为 debug artifact 保留，必须在 summary 中标注为 non-canonical；
+- summary 需要显式记录每条 explicit edge obligation 及其最终 ownership（standalone segment 或 consumer-side fused segment）。

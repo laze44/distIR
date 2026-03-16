@@ -1,0 +1,7 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
+    "ENABLE_TOOL_SEARCH": "false",
+    "ANTHROPIC_API_KEY": "sk-kimi-7eud1jgq1vDtOUL58YSmrhy7KX2ErNfa1bw0YZ4MOpeRmTUVUeM80P5vBkVmLhWO"
+  }
+}

@@ -6,7 +6,11 @@ from .estimate import EstimateResult, estimate_program, load_hardware_config
 from .ffn_graph_search import FFNJointSearchResult, search_ffn
 from .ffn_two_step_search import (
     EdgeReshardTransition,
+    FFNEdgeLoweringOwnership,
     FFNLayoutPlan,
+    FFNOperatorBoundaryClass,
+    FFNSegmentSelection,
+    FFNStep1LayoutStats,
     FFNTwoStepSearchResult,
     search_ffn_two_step,
 )

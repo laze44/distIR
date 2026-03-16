@@ -9,6 +9,7 @@ from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh, ShardType, ShardingSpec
 from mercury.ir.elements import Axis, Buffer
 from mercury.ir.nodes import AxisDef, BufferMatch, Program
+from mercury.ir.utils import get_io_buffers
 from mercury.search.estimate import EstimateResult, load_hardware_config
 from mercury.search.ffn_two_step_search import search_ffn_two_step
 from mercury.search.mapping_constraints import (
@@ -30,6 +31,21 @@ def _build_program_from_source(source: str):
         if isinstance(node, ast.FunctionDef):
             return builder.visit(node)
     raise ValueError("Could not find function definition")
+
+
+def _matrix_layout_signature(program: Program, matrix_name: str):
+    for buffer in program.visit(get_io_buffers):
+        if buffer.tensor.upper() == matrix_name:
+            return logical_layout_signature_from_buffer(buffer)
+    raise ValueError(f"Program '{program.name}' missing matrix buffer '{matrix_name}'")
+
+
+def _operator_boundary_signature(program: Program):
+    return (
+        _matrix_layout_signature(program, "A"),
+        _matrix_layout_signature(program, "B"),
+        _matrix_layout_signature(program, "C"),
+    )
 
 
 def _build_mock_program(
@@ -156,9 +172,79 @@ def test_search_ffn_two_step_returns_ranked_plans_with_real_candidates():
     assert set(result.selected_programs.keys()) == {"gate", "up", "down"}
     assert set(result.selected_plan.activation_layouts.keys()) == {"L_in", "L_mid", "L_out"}
     assert set(result.selected_plan.weight_layouts.keys()) == {"W_gate", "W_up", "W_down"}
+    assert result.candidate_counts == {
+        operator_name: len(candidate_programs[operator_name])
+        for operator_name in ("gate", "up", "down")
+    }
     assert 1 <= len(result.ranked_plans) <= 2
     assert result.ranked_plans[0].step1_total_time_ms <= result.ranked_plans[-1].step1_total_time_ms
     assert result.total_time_ms >= 0.0
+    assert abs(result.total_time_ms - sum(result.step2_segment_costs_ms.values())) < 1e-9
+    assert set(result.edge_ownership.keys()) == set(result.explicit_edge_obligations.keys())
+    assert {"gate", "up"}.issubset(
+        {segment.segment_id for segment in result.selected_segments}
+    )
+    assert any(
+        segment.segment_id in ("down", "down_chain")
+        for segment in result.selected_segments
+    )
+
+    gate_boundary_classes = {
+        _operator_boundary_signature(program)
+        for program in candidate_programs["gate"]
+    }
+    up_boundary_classes = {
+        _operator_boundary_signature(program)
+        for program in candidate_programs["up"]
+    }
+    down_boundary_classes = {
+        _operator_boundary_signature(program)
+        for program in candidate_programs["down"]
+    }
+    unique_l_in_layouts = {
+        _matrix_layout_signature(program, "A")
+        for operator_name in ("gate", "up")
+        for program in candidate_programs[operator_name]
+    }
+    unique_l_mid_layouts = {
+        _matrix_layout_signature(program, "C")
+        for operator_name in ("gate", "up")
+        for program in candidate_programs[operator_name]
+    }
+    unique_l_mid_layouts.update(
+        _matrix_layout_signature(program, "A")
+        for program in candidate_programs["down"]
+    )
+    assert result.step1_layout_stats.unique_l_in_count == len(unique_l_in_layouts)
+    assert result.step1_layout_stats.unique_l_mid_count == len(unique_l_mid_layouts)
+    assert result.step1_layout_stats.gate_boundary_class_count == len(gate_boundary_classes)
+    assert result.step1_layout_stats.up_boundary_class_count == len(up_boundary_classes)
+    assert result.step1_layout_stats.down_boundary_class_count == len(down_boundary_classes)
+    assert result.step1_layout_stats.projected_l_out_count == len(
+        {signature[2] for signature in down_boundary_classes}
+    )
+    assert result.step1_layout_stats.projected_w_gate_count == len(
+        {signature[1] for signature in gate_boundary_classes}
+    )
+    assert result.step1_layout_stats.projected_w_up_count == len(
+        {signature[1] for signature in up_boundary_classes}
+    )
+    assert result.step1_layout_stats.projected_w_down_count == len(
+        {signature[1] for signature in down_boundary_classes}
+    )
+    assert result.step1_layout_stats.total_plan_count == (
+        len(unique_l_in_layouts)
+        * len(unique_l_mid_layouts)
+        * len(gate_boundary_classes)
+        * len(up_boundary_classes)
+        * len(down_boundary_classes)
+    )
+    assert result.step1_layout_stats.total_plan_count >= len(result.ranked_plans)
+    assert (
+        result.selected_plan.activation_layouts["L_out"]
+        == result.selected_plan.boundary_classes["down"].layout_c
+    )
+    assert "down.C->L_out" not in result.selected_plan.step1_edge_costs_ms
 
     assert (
         logical_layout_signature_from_buffer(result.selected_programs["gate"].body[3].buffer)
@@ -167,6 +253,18 @@ def test_search_ffn_two_step_returns_ranked_plans_with_real_candidates():
     assert (
         logical_layout_signature_from_buffer(result.selected_programs["down"].body[5].buffer)
         == result.selected_plan.operator_layouts["down"]["C"]
+    )
+    assert (
+        result.selected_plan.operator_layouts["gate"]["A"]
+        == result.selected_plan.boundary_classes["gate"].layout_a
+    )
+    assert (
+        result.selected_plan.operator_layouts["up"]["B"]
+        == result.selected_plan.boundary_classes["up"].layout_b
+    )
+    assert (
+        result.selected_plan.operator_layouts["down"]["C"]
+        == result.selected_plan.boundary_classes["down"].layout_c
     )
 
 
@@ -259,6 +357,160 @@ def test_search_ffn_two_step_step2_uses_logical_layout_filter(monkeypatch):
     assert result.selected_programs["gate"].name == "gate_exact_slow"
     assert result.selected_programs["up"].name == "up_exact_slow"
     assert result.selected_programs["down"].name == "down_exact_slow"
+    assert (
+        _matrix_layout_signature(result.selected_programs["gate"], "A")
+        == result.selected_plan.boundary_classes["gate"].layout_a
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["gate"], "B")
+        == result.selected_plan.boundary_classes["gate"].layout_b
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["gate"], "C")
+        == result.selected_plan.boundary_classes["gate"].layout_c
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["up"], "A")
+        == result.selected_plan.boundary_classes["up"].layout_a
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["up"], "B")
+        == result.selected_plan.boundary_classes["up"].layout_b
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["up"], "C")
+        == result.selected_plan.boundary_classes["up"].layout_c
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["down"], "A")
+        == result.selected_plan.boundary_classes["down"].layout_a
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["down"], "B")
+        == result.selected_plan.boundary_classes["down"].layout_b
+    )
+    assert (
+        _matrix_layout_signature(result.selected_programs["down"], "C")
+        == result.selected_plan.boundary_classes["down"].layout_c
+    )
+    assert "L_mid->down.A" not in result.explicit_edge_obligations
+    assert any(segment.segment_id == "down" for segment in result.selected_segments)
+    assert all(
+        "L_mid->down.A" not in segment.owned_edge_obligations
+        for segment in result.selected_segments
+    )
+    assert abs(result.total_time_ms - sum(result.step2_segment_costs_ms.values())) < 1e-9
+
+
+def test_search_ffn_two_step_owns_mid_edge_with_consumer_down_chain(monkeypatch):
+    from mercury.search import ffn_two_step_search as two_step_module
+
+    mesh_shape = (2, 2)
+    i0 = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+    m0 = [ShardType.REPLICATE, (ShardType.SHARD, [0])]
+    m1 = [ShardType.REPLICATE, (ShardType.SHARD, [1])]
+    o0 = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+    b0 = [ShardType.REPLICATE, ShardType.REPLICATE]
+
+    step1_candidates = {
+        "gate": [_build_mock_program("gate_plan", mesh_shape, i0, b0, m0, k_dim=8, n_dim=16)],
+        "up": [_build_mock_program("up_plan", mesh_shape, i0, b0, m0, k_dim=8, n_dim=16)],
+        "down": [_build_mock_program("down_plan", mesh_shape, m1, b0, o0, k_dim=16, n_dim=8)],
+    }
+
+    rerun_pools = {
+        "gate_seed": [
+            _build_mock_program("gate_exact", mesh_shape, i0, b0, m0, k_dim=8, n_dim=16),
+        ],
+        "up_seed": [
+            _build_mock_program("up_exact", mesh_shape, i0, b0, m0, k_dim=8, n_dim=16),
+        ],
+        "down_seed": [
+            _build_mock_program("down_exact", mesh_shape, m1, b0, o0, k_dim=16, n_dim=8),
+        ],
+    }
+
+    exec_costs = {
+        "gate_plan": 1.0,
+        "up_plan": 1.0,
+        "down_plan": 1.0,
+        "gate_exact": 1.0,
+        "up_exact": 1.0,
+        "down_exact": 1.0,
+    }
+    observed_progress = []
+
+    def fake_estimate_program(program, hw_config):
+        del hw_config
+        exec_ms = exec_costs[program.name]
+        return EstimateResult(exec_ms, 0.0, exec_ms)
+
+    def fake_estimate_reshard(src_layout, dst_layout, hw_config, origin_mesh, dtype=None):
+        del hw_config, origin_mesh, dtype
+        return 0.0 if src_layout == dst_layout else 5.0
+
+    def fake_search_with_progress(
+        input_program,
+        origin_mesh,
+        split_axis_names,
+        tensor_mapping_constraints=None,
+        program_filter=None,
+        progress_desc=None,
+        show_progress=True,
+        miniters=32,
+        mininterval=0.5,
+    ):
+        del origin_mesh, split_axis_names, tensor_mapping_constraints
+        del show_progress, miniters, mininterval
+        observed_progress.append(progress_desc)
+        for program in rerun_pools[input_program.name]:
+            if program_filter is None or program_filter(program):
+                yield program
+
+    monkeypatch.setattr(two_step_module, "estimate_program", fake_estimate_program)
+    monkeypatch.setattr(two_step_module, "search_with_progress", fake_search_with_progress)
+    monkeypatch.setattr(
+        two_step_module,
+        "estimate_reshard_time_from_logical_layout",
+        fake_estimate_reshard,
+    )
+
+    operator_programs = {
+        "gate": Program(name="gate_seed", inputs=[], defaults=[], outputs=[], body=[], mesh=None),
+        "up": Program(name="up_seed", inputs=[], defaults=[], outputs=[], body=[], mesh=None),
+        "down": Program(name="down_seed", inputs=[], defaults=[], outputs=[], body=[], mesh=None),
+    }
+
+    hw_config = load_hardware_config("config/h100.json")
+    origin_mesh = DeviceMesh(list(range(4)), mesh_shape)
+    result = search_ffn_two_step(
+        operator_programs=operator_programs,
+        origin_mesh=origin_mesh,
+        split_axis_names=["I", "J", "K"],
+        hw_config=hw_config,
+        layout_top_k=1,
+        candidate_programs=step1_candidates,
+        show_progress=False,
+    )
+
+    assert "L_mid->down.A" in result.explicit_edge_obligations
+    ownership = result.edge_ownership["L_mid->down.A"]
+    assert ownership.owner_kind == "consumer_segment"
+    assert ownership.owner_segment_id == "down_chain"
+    assert ownership.materialized_as_standalone is False
+    assert "edge:L_mid->down.A" not in result.step2_segment_costs_ms
+
+    down_chain_segment = next(
+        segment for segment in result.selected_segments if segment.segment_id == "down_chain"
+    )
+    assert down_chain_segment.owned_edge_obligations == ("L_mid->down.A",)
+    assert abs(
+        down_chain_segment.total_time_ms
+        - (result.step2_operator_costs_ms["down"] + ownership.cost_ms)
+    ) < 1e-9
+    assert abs(result.total_time_ms - sum(result.step2_segment_costs_ms.values())) < 1e-9
+    assert "step2[down:isolated_operator]" in observed_progress
+    assert "step2[down:consumer_chain_edge_consumer]" in observed_progress
 
 
 def test_step1_allows_mismatch_with_explicit_edge_transitions(monkeypatch):
@@ -295,7 +547,7 @@ def test_step1_allows_mismatch_with_explicit_edge_transitions(monkeypatch):
 
     hw_config = load_hardware_config("config/h100.json")
     origin_mesh = DeviceMesh(list(range(4)), mesh_shape)
-    ranked_plans, candidate_counts = two_step_module._top_plans_from_candidates(
+    ranked_plans, candidate_counts, step1_layout_stats = two_step_module._top_plans_from_candidates(
         candidate_programs=candidates,
         hw_config=hw_config,
         origin_mesh=origin_mesh,
@@ -303,10 +555,94 @@ def test_step1_allows_mismatch_with_explicit_edge_transitions(monkeypatch):
     )
 
     assert candidate_counts == {"gate": 1, "up": 1, "down": 1}
+    assert step1_layout_stats.unique_l_in_count == 2
+    assert step1_layout_stats.unique_l_mid_count == 2
+    assert step1_layout_stats.gate_boundary_class_count == 1
+    assert step1_layout_stats.up_boundary_class_count == 1
+    assert step1_layout_stats.down_boundary_class_count == 1
+    assert step1_layout_stats.projected_l_out_count == 1
+    assert step1_layout_stats.projected_w_gate_count == 1
+    assert step1_layout_stats.projected_w_up_count == 1
+    assert step1_layout_stats.projected_w_down_count == 1
+    assert step1_layout_stats.total_plan_count == 4
     assert len(ranked_plans) == 1
     plan = ranked_plans[0]
     assert len(plan.edge_transitions) > 0
     assert sum(plan.step1_edge_costs_ms.values()) > 0.0
+    assert "down.C->L_out" not in plan.step1_edge_costs_ms
+    assert plan.activation_layouts["L_out"] == plan.boundary_classes["down"].layout_c
     assert plan.step1_total_time_ms == (
         sum(plan.step1_operator_costs_ms.values()) + sum(plan.step1_edge_costs_ms.values())
     )
+
+
+def test_step1_keeps_distinct_gate_boundary_classes_with_same_projected_weight(monkeypatch):
+    from mercury.search import ffn_two_step_search as two_step_module
+
+    mesh_shape = (2, 2)
+    i0 = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+    i1 = [(ShardType.SHARD, [1]), ShardType.REPLICATE]
+    m0 = [ShardType.REPLICATE, (ShardType.SHARD, [0])]
+    o0 = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+    b_shared = [ShardType.REPLICATE, ShardType.REPLICATE]
+    b_up = [ShardType.REPLICATE, (ShardType.SHARD, [1])]
+    b_down = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+
+    candidates = {
+        "gate": [
+            _build_mock_program("gate_cls0", mesh_shape, i0, b_shared, m0, k_dim=8, n_dim=16),
+            _build_mock_program("gate_cls1", mesh_shape, i1, b_shared, m0, k_dim=8, n_dim=16),
+        ],
+        "up": [_build_mock_program("up_cls", mesh_shape, i1, b_up, m0, k_dim=8, n_dim=16)],
+        "down": [_build_mock_program("down_cls", mesh_shape, m0, b_down, o0, k_dim=16, n_dim=8)],
+    }
+
+    def fake_estimate_program(program, hw_config):
+        del hw_config
+        return EstimateResult(1.0, 0.0, 1.0)
+
+    def fake_estimate_reshard(src_layout, dst_layout, hw_config, origin_mesh, dtype=None):
+        del hw_config, origin_mesh, dtype
+        return 0.0 if src_layout == dst_layout else 1.0
+
+    monkeypatch.setattr(two_step_module, "estimate_program", fake_estimate_program)
+    monkeypatch.setattr(
+        two_step_module,
+        "estimate_reshard_time_from_logical_layout",
+        fake_estimate_reshard,
+    )
+
+    hw_config = load_hardware_config("config/h100.json")
+    origin_mesh = DeviceMesh(list(range(4)), mesh_shape)
+    ranked_plans, _, step1_layout_stats = two_step_module._top_plans_from_candidates(
+        candidate_programs=candidates,
+        hw_config=hw_config,
+        origin_mesh=origin_mesh,
+        layout_top_k=2,
+    )
+
+    assert len(ranked_plans) == 2
+    assert step1_layout_stats.unique_l_in_count == 2
+    assert step1_layout_stats.unique_l_mid_count == 1
+    assert step1_layout_stats.gate_boundary_class_count == 2
+    assert step1_layout_stats.up_boundary_class_count == 1
+    assert step1_layout_stats.down_boundary_class_count == 1
+    assert step1_layout_stats.projected_w_gate_count == 1
+    assert step1_layout_stats.projected_w_up_count == 1
+    assert step1_layout_stats.projected_w_down_count == 1
+    assert step1_layout_stats.projected_l_out_count == 1
+    assert step1_layout_stats.total_plan_count == 4
+
+    gate_boundary_summaries = {
+        plan.boundary_classes["gate"].layout_a.to_summary()
+        + "|"
+        + plan.boundary_classes["gate"].layout_c.to_summary()
+        for plan in ranked_plans
+    }
+    assert len(gate_boundary_summaries) == 2
+    assert ranked_plans[0].weight_layouts["W_gate"] == ranked_plans[1].weight_layouts["W_gate"]
+    assert (
+        ranked_plans[0].step1_operator_costs_ms["gate"]
+        == ranked_plans[1].step1_operator_costs_ms["gate"]
+    )
+    assert ranked_plans[0].step1_total_time_ms != ranked_plans[1].step1_total_time_ms
