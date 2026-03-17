@@ -45,6 +45,13 @@ Auto-tuner 的优化目标是：
 每个候选都进行完整 lowering 并在真实硬件上 profile，以实测时延为准。
 在理论估算路径中，`async_collective_overlap` 采用 tile 级流水模型（warmup / steady-state / drain）而非将 collective 全量视作阻塞。
 
+**重要：async overlap 排名仅在合法化成功后生效。** estimator 优先使用 `ManagedReductionPipelineRegion` 中的合法化信息来计算 async pipeline overhead。未合法化的 async 候选不会获得 overlap 评分优势，而是退化为 `blocking_collective` 排名和 lowering。
+
+合法化流程：
+1. legalization pass 检查 overlap axis tile 数、collective 参与者数、消费者可 retime 性
+2. verifier 验证 pipeline region 不变量（每 slot 至多一个在途 work、wait-before-reuse、retire-after-wait）
+3. 仅通过验证的 region 才允许使用 async pipeline 估算和 async codegen
+
 ### 内存约束
 
 基于 `CommIR` 的静态布局分析估算 per-worker footprint；超过容量的候选在早期剪枝。

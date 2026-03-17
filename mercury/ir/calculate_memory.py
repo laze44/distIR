@@ -3,7 +3,7 @@
 from typing import Optional
 from mercury.ir.elements import Axis, Buffer
 from mercury.ir.nodes import BufferMatch, IRNode
-from mercury.ir.utils import collect_reduce, get_buffers, get_element_size
+from mercury.ir.utils import collect_pipeline_regions, collect_reduce, get_buffers, get_element_size
 
 
 def get_buffer_size(program: IRNode) -> int:
@@ -13,14 +13,28 @@ def get_buffer_size(program: IRNode) -> int:
     you should add them in the return value, because
     they are not tracked by the ir
     """
-        
+
     buffers = program.visit(get_buffers)
     reduce_ops = program.visit(collect_reduce)
+
+    # Collect async stage counts from legalized pipeline regions first
     async_stage_count = {}
+    pipeline_regions = program.visit(collect_pipeline_regions)
+    legalized_bufs = set()
+    for region in pipeline_regions:
+        if region.legalized and region.reduce_op is not None:
+            buffer_name = region.reduce_op.buffer.tensor
+            stage_count = max(2, region.stage_count)
+            async_stage_count[buffer_name] = max(async_stage_count.get(buffer_name, 1), stage_count)
+            legalized_bufs.add(buffer_name)
+
+    # Fallback: use ReduceOp metadata for non-legalized async candidates
     for reduce_op in reduce_ops:
         if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") != "async_collective_overlap":
             continue
         buffer_name = reduce_op.buffer.tensor
+        if buffer_name in legalized_bufs:
+            continue
         stage_count = max(2, int(getattr(reduce_op, "async_collective_stage_count", 2)))
         async_stage_count[buffer_name] = max(async_stage_count.get(buffer_name, 1), stage_count)
 

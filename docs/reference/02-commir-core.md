@@ -62,4 +62,36 @@
 - slot 复用前 `wait`
 - loop 末尾 `drain wait`
 
-从而替代旧版“在 `load_buffer(reduce_buf)` 时隐式触发阻塞 collective”的行为。
+从而替代旧版”在 `load_buffer(reduce_buf)` 时隐式触发阻塞 collective”的行为。
+
+### Pipeline 合法化（Pipeline Legalization）
+
+`async_collective_overlap` 策略不再仅依靠 `ReduceOp` 上的元数据注解来声明 overlap。在 estimation 和 codegen 之前，系统执行一次 **legalization pass**：
+
+1. 将满足条件的 async managed reduction 转化为显式的 `ManagedReductionPipelineRegion` IR 节点
+2. 合法化条件包括：
+   - overlap axis 至少有 2 个 tile
+   - collective 参与者 > 1
+   - reduction buffer 的消费者可被 retime（仅有一条直接消费路径）
+   - 无额外同迭代消费者强制提前 wait
+3. 不满足条件的 async 候选被 fallback 为 `blocking_collective`
+
+### 待退役 Tile 状态（Pending-Tile Retirement）
+
+合法化后的 pipeline region 使用 `PendingTileDescriptor` 结构化描述符来跟踪在途 tile 身份：
+
+- `slot_index`：pipeline slot 编号
+- `tile_coords`：沿 overlap axis 的逻辑 tile 坐标
+- `reduce_buffer`：正在执行 collective 的 reduction buffer
+- `output_buffer` / `retire_indices`：退役时写入的目标位置
+
+这替代了旧版 codegen 中的 ad-hoc 数组（`pending_j`, `works`）方式。
+
+### Wait-at-Reuse / Drain 语义
+
+合法化 pipeline 的等待策略：
+
+- **wait-at-reuse**：仅在 slot 即将被新 tile 复用时 wait 前一个 tile 的 collective
+- **drain**：overlap loop 退出时，对所有仍在途的 slot 执行 wait 并退役延迟消费者
+- 完成后的 tile 通过 consumer store 写入最终输出（delayed retirement）
+

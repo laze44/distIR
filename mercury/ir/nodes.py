@@ -86,6 +86,94 @@ class AsyncCollectiveLifecycle:
     wait_on_reuse_op: str = "all_reduce_wait_on_reuse"
     drain_wait_op: str = "all_reduce_wait_drain"
 
+
+@dataclass
+class PendingTileDescriptor:
+    """Structured descriptor for in-flight tiles in a managed-reduction pipeline.
+
+    Carries the retire-time tile identity so codegen can retire completed tiles
+    without reconstructing identity from ad-hoc arrays like ``pending_j``.
+
+    Args:
+        slot_index: The pipeline slot (0 .. stage_count-1) that holds this tile.
+        tile_coords: Logical tile coordinates along the overlap axis.
+        output_buffer: The output buffer that the tile retires into.
+        retire_indices: Index expressions needed to write the retired tile.
+        reduce_buffer: The reduction buffer whose collective is in flight.
+    """
+
+    slot_index: int = 0
+    tile_coords: Optional[List[Union['Axis', int]]] = None
+    output_buffer: Optional['Buffer'] = None
+    retire_indices: Optional[List[Union[int, 'Axis']]] = None
+    reduce_buffer: Optional['Buffer'] = None
+
+
+@dataclass
+class ManagedReductionPipelineRegion(IRNode):
+    """Explicit IR form for a legalized async managed-reduction pipeline.
+
+    Represents one managed reduction pipeline over one overlap axis.  Created
+    by the legalization pass when an ``async_collective_overlap`` candidate
+    satisfies all realizability checks.
+
+    Args:
+        reduce_op: The original ``ReduceOp`` that drives the pipeline.
+        overlap_axis: The loop axis along which tiles are pipelined.
+        stage_count: Number of double-buffer slots (typically 2).
+        tile_count: Number of tiles along the overlap axis.
+        lifecycle: Collective start/wait lifecycle markers.
+        pending_tiles: Structured descriptors for in-flight tile state.
+        consumer_store: The ``BufferStore`` that retires a completed tile.
+        legalized: Whether the region passed legalization verification.
+    """
+
+    reduce_op: 'ReduceOp' = None
+    overlap_axis: Optional[Axis] = None
+    stage_count: int = 2
+    tile_count: int = 1
+    lifecycle: Optional[AsyncCollectiveLifecycle] = field(default_factory=AsyncCollectiveLifecycle)
+    pending_tiles: List[PendingTileDescriptor] = field(default_factory=list)
+    consumer_store: Optional['BufferStore'] = None
+    legalized: bool = False
+
+    def visit(self, fn: Callable[['IRNode'], T], fn_epiloge: Optional[Callable] = None) -> List[T]:
+        results = [fn(self)]
+        if self.reduce_op is not None:
+            results.extend(self.reduce_op.visit(fn, fn_epiloge))
+        if self.consumer_store is not None:
+            results.extend(self.consumer_store.visit(fn, fn_epiloge))
+        if fn_epiloge is not None:
+            fn_epiloge(self)
+        return [r for r in results if r is not None]
+
+    def __str__(self, tabs: int = 0) -> str:
+        prefix = "  " * tabs
+        overlap_name = self.overlap_axis.name if self.overlap_axis is not None else None
+        reduce_buf = self.reduce_op.buffer.tensor if self.reduce_op is not None else None
+        return (
+            f"{prefix}ManagedReductionPipelineRegion("
+            f"reduce_buf={reduce_buf}, overlap_axis={overlap_name}, "
+            f"stages={self.stage_count}, tiles={self.tile_count}, "
+            f"legalized={self.legalized})"
+        )
+
+    def _deepcopy_impl(self, memo: Dict[int, Any]) -> 'ManagedReductionPipelineRegion':
+        if id(self) in memo:
+            return memo[id(self)]
+        result = ManagedReductionPipelineRegion(
+            reduce_op=copy.deepcopy(self.reduce_op, memo) if self.reduce_op is not None else None,
+            overlap_axis=copy.deepcopy(self.overlap_axis, memo) if self.overlap_axis is not None else None,
+            stage_count=self.stage_count,
+            tile_count=self.tile_count,
+            lifecycle=copy.deepcopy(self.lifecycle, memo),
+            pending_tiles=copy.deepcopy(self.pending_tiles, memo),
+            consumer_store=copy.deepcopy(self.consumer_store, memo) if self.consumer_store is not None else None,
+            legalized=self.legalized,
+        )
+        memo[id(self)] = result
+        return result
+
 @dataclass
 class PyNode(IRNode):
     """Node for preserving original Python AST."""

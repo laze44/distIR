@@ -6,10 +6,10 @@ import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 from mercury.ir.nodes import (
     IRNode, Program, GridLoop, BufferLoad, BufferStore,
-    PyNode, ReduceOp, AxisDef, BufferMatch
+    ManagedReductionPipelineRegion, PyNode, ReduceOp, AxisDef, BufferMatch
 )
 from mercury.ir.elements import Axis
-from mercury.ir.utils import collect_reduce
+from mercury.ir.utils import collect_pipeline_regions, collect_reduce
 import textwrap
 
 class PyTorchCodegen:
@@ -96,8 +96,38 @@ class PyTorchCodegen:
         self.reduce_buffers = {}
         self.async_collective_buffers = {}
         self.async_slot_vars = {}
+        self.pipeline_regions = {}
+
+        # First, collect legalized pipeline regions
+        for region in program.visit(collect_pipeline_regions):
+            if region.legalized and region.reduce_op is not None:
+                reduce_op = region.reduce_op
+                buffer_name = reduce_op.buffer.tensor
+                self.reduce_buffers[buffer_name] = reduce_op
+                self.pipeline_regions[buffer_name] = region
+                collective_shard_dims = tuple(self._collective_shard_dims(reduce_op))
+                if len(collective_shard_dims) == 0:
+                    continue
+                overlap_axis = region.overlap_axis
+                if overlap_axis is None:
+                    continue
+                stage_count = max(2, region.stage_count)
+                self.async_collective_buffers[buffer_name] = {
+                    "overlap_axis_name": overlap_axis.name,
+                    "stage_count": stage_count,
+                    "collective_shard_dims": collective_shard_dims,
+                    "slots_name": f"{buffer_name}_async_slots",
+                    "works_name": f"{buffer_name}_async_works",
+                    "pending_name": f"{buffer_name}_pending",
+                    "use_slots": False,
+                    "legalized": True,
+                }
+
+        # Then, collect from ReduceOp metadata (backward-compatible path)
         for reduce_op in program.visit(collect_reduce):
             self.reduce_buffers[reduce_op.buffer.tensor] = reduce_op
+            if reduce_op.buffer.tensor in self.pipeline_regions:
+                continue
             collective_shard_dims = tuple(self._collective_shard_dims(reduce_op))
             if len(collective_shard_dims) == 0:
                 continue
@@ -115,6 +145,7 @@ class PyTorchCodegen:
                 "slots_name": f"{buffer_name}_async_slots",
                 "works_name": f"{buffer_name}_async_works",
                 "use_slots": False,
+                "legalized": False,
             }
 
     def visit(self, node: IRNode) -> Optional[str]:
@@ -293,8 +324,27 @@ class PyTorchCodegen:
             self.indent_level -= 1
             if len(inner_active_axis) > 0:
                 self.indent_level -= 1
-            
-            
+
+    def visit_ManagedReductionPipelineRegion(self, node: ManagedReductionPipelineRegion) -> None:
+        """Generate code for a legalized pipeline region.
+
+        The region contains a reduce_op and an optional consumer_store.  The
+        actual slot/wait/drain mechanics are handled by existing ReduceOp and
+        GridLoop codegen — this visitor emits a descriptive comment to mark the
+        legalized region boundary, then delegates to child visitors.
+        """
+        buffer_name = node.reduce_op.buffer.tensor if node.reduce_op is not None else "?"
+        overlap_name = node.overlap_axis.name if node.overlap_axis is not None else "?"
+        self.emit(
+            f"# --- pipeline region: {buffer_name}, "
+            f"overlap={overlap_name}, stages={node.stage_count}, "
+            f"tiles={node.tile_count} ---"
+        )
+        if node.reduce_op is not None:
+            self.visit(node.reduce_op)
+        if node.consumer_store is not None:
+            self.visit(node.consumer_store)
+
     def visit_BufferMatch(self, node: BufferMatch) -> None:
         """Process buffer matching."""
         
@@ -320,6 +370,9 @@ class PyTorchCodegen:
                     f"for _ in range({stage_count})]"
                 )
                 self.emit(f"{works_name} = [None for _ in range({stage_count})]")
+                if async_config.get("legalized", False):
+                    pending_name = async_config.get("pending_name", f"{node.buffer.tensor}_pending")
+                    self.emit(f"{pending_name} = [None for _ in range({stage_count})]")
                 return
             # Generate temporary buffer
             if len(self.active_ring_axes) > 0:
@@ -473,12 +526,22 @@ class PyTorchCodegen:
                     if config["overlap_axis_name"] != axis.name:
                         continue
                     works_name = config["works_name"]
+                    is_legalized = config.get("legalized", False)
                     self.emit(f"for _slot in range({config['stage_count']}):")
                     self.indent_level += 1
                     self.emit(f"if {works_name}[_slot] is not None:")
                     self.indent_level += 1
+                    lifecycle = None
+                    region = self.pipeline_regions.get(buffer_name) if is_legalized else None
+                    if region is not None:
+                        lifecycle = region.lifecycle
+                    if lifecycle is not None:
+                        self.emit(f"# {lifecycle.drain_wait_op}")
                     self.emit(f"{works_name}[_slot].wait()")
                     self.emit(f"{works_name}[_slot] = None")
+                    if is_legalized:
+                        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+                        self.emit(f"{pending_name}[_slot] = None  # retire pending tile")
                     self.indent_level -= 1
                     self.indent_level -= 1
             # this is a ad-hoc solution, now we create the collective when the buffer is loaded

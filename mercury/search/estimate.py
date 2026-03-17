@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 
 from mercury.ir.elements import Buffer
-from mercury.ir.nodes import BufferLoad, BufferStore, Program, ReduceOp
-from mercury.ir.utils import collect_axis, collect_reduce, get_element_size
+from mercury.ir.nodes import BufferLoad, BufferStore, ManagedReductionPipelineRegion, Program, ReduceOp
+from mercury.ir.utils import collect_axis, collect_pipeline_regions, collect_reduce, get_element_size
 
 
 _DTYPE_TO_CONFIG_KEY: Dict[torch.dtype, str] = {
@@ -311,11 +311,27 @@ def _estimate_collective_reduce_events(
     events: List[_CommEvent] = []
     reduce_ops = program.visit(collect_reduce)
 
+    # Build the set of reduce buffers that have legalized pipeline regions
+    legalized_reduce_bufs: Set[str] = set()
+    pipeline_regions = program.visit(collect_pipeline_regions)
+    for region in pipeline_regions:
+        if region.legalized and region.reduce_op is not None:
+            legalized_reduce_bufs.add(region.reduce_op.buffer.tensor)
+    has_any_legalized = len(legalized_reduce_bufs) > 0
+
     for reduce_op in reduce_ops:
         if len(reduce_op.shard_dim) == 0:
             continue
-        if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") == "async_collective_overlap":
-            continue
+        strategy = getattr(reduce_op, "managed_collective_strategy", "blocking_collective")
+        if strategy == "async_collective_overlap":
+            if has_any_legalized:
+                # Only skip if this specific reduction was legalized
+                if reduce_op.buffer.tensor in legalized_reduce_bufs:
+                    continue
+                # Otherwise, non-legalized async candidates are treated as blocking
+            else:
+                # Backward-compatible: no regions in program, trust ReduceOp metadata
+                continue
 
         ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
         shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
@@ -354,8 +370,62 @@ def _estimate_async_collective_pipeline_overhead_ms(
     compute_time_ms: float,
 ) -> float:
     overhead_ms = 0.0
-    reduce_ops = program.visit(collect_reduce)
     memory_bandwidth = _memory_bandwidth_bytes_per_second(hw_config)
+
+    # Prefer legalized pipeline regions if available
+    pipeline_regions = program.visit(collect_pipeline_regions)
+    legalized_regions = [r for r in pipeline_regions if r.legalized]
+
+    if len(legalized_regions) > 0:
+        # Use legalized regions for estimation
+        for region in legalized_regions:
+            reduce_op = region.reduce_op
+            if reduce_op is None:
+                continue
+
+            ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
+            shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
+            shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
+            if len(shard_dims) == 0:
+                continue
+
+            participants = 1
+            for mesh_dim in shard_dims:
+                participants *= int(program.mesh.shape[mesh_dim])
+            if participants <= 1:
+                continue
+
+            tile_count = max(1, region.tile_count)
+            if tile_count < 2:
+                continue
+            stage_count = max(2, region.stage_count)
+
+            data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
+            inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
+            bandwidth, latency_s = _link_params(hw_config, inter_node)
+
+            rounds = 2.0 * (participants - 1.0)
+            transfer_factor = 2.0 * (participants - 1.0) / participants
+            tile_comm_ms = (rounds * latency_s + transfer_factor * (data_bytes / bandwidth)) * 1000.0
+            tile_compute_ms = compute_time_ms / float(tile_count)
+
+            warmup_ms = tile_compute_ms
+            steady_state_ms = float(tile_count - 1) * max(tile_compute_ms, tile_comm_ms)
+            drain_ms = tile_comm_ms
+            pipeline_total_ms = warmup_ms + steady_state_ms + drain_ms
+
+            baseline_compute_ms = float(tile_count) * tile_compute_ms
+            pipeline_overhead_ms = max(0.0, pipeline_total_ms - baseline_compute_ms)
+
+            extra_stage_bytes = float(stage_count - 1) * data_bytes
+            memory_overhead_ms = (extra_stage_bytes / memory_bandwidth) * 1000.0
+
+            overhead_ms += pipeline_overhead_ms + memory_overhead_ms
+
+        return overhead_ms
+
+    # Fallback: use ReduceOp metadata (backward-compatible path)
+    reduce_ops = program.visit(collect_reduce)
 
     for reduce_op in reduce_ops:
         if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") != "async_collective_overlap":

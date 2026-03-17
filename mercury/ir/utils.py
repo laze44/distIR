@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 
 from mercury.ir.elements import Axis, Buffer
-from mercury.ir.nodes import AxisDef, BufferLoad, BufferMatch, BufferStore, GridLoop, IRNode, Program, ReduceOp
+from mercury.ir.nodes import AxisDef, BufferLoad, BufferMatch, BufferStore, GridLoop, IRNode, ManagedReductionPipelineRegion, Program, ReduceOp
 
 def get_element_size(dtype):
     try:
@@ -40,6 +40,9 @@ def collect_loops(node: IRNode) -> Optional[GridLoop]:
 
 def collect_reduce(node: IRNode) -> Optional[ReduceOp]:
     return node if isinstance(node, ReduceOp) else None
+
+def collect_pipeline_regions(node: IRNode) -> Optional[ManagedReductionPipelineRegion]:
+    return node if isinstance(node, ManagedReductionPipelineRegion) else None
 
 def collect_axis(node: IRNode) -> Optional[Axis]:
     return node.axis if isinstance(node, AxisDef) else None
