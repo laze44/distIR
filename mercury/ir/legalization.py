@@ -7,7 +7,7 @@ them into ``ManagedReductionPipelineRegion`` nodes.  Candidates that fail
 legalization are downgraded to ``blocking_collective``.
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from mercury.ir.elements import Axis, Buffer
 from mercury.ir.nodes import (
@@ -100,9 +100,18 @@ def _no_same_iteration_consumer(
 
 
 def _build_pending_tiles(
-    overlap_axis: Axis, stage_count: int, reduce_buffer: Buffer
+    overlap_axis: Axis,
+    stage_count: int,
+    reduce_buffer: Buffer,
+    consumer_store: Optional[BufferStore] = None,
 ) -> List[PendingTileDescriptor]:
     tile_count = int(overlap_axis.size) // int(overlap_axis.min_block_size)
+    output_buffer = consumer_store.buffer if consumer_store is not None else None
+    retire_indices: Optional[List[Union[int, Axis]]] = None
+    if consumer_store is not None:
+        retire_indices = [
+            idx for idx in consumer_store.indices if isinstance(idx, (int, Axis))
+        ]
     descriptors = []
     for slot in range(min(stage_count, tile_count)):
         descriptors.append(
@@ -110,6 +119,8 @@ def _build_pending_tiles(
                 slot_index=slot,
                 tile_coords=[overlap_axis],
                 reduce_buffer=reduce_buffer,
+                output_buffer=output_buffer,
+                retire_indices=retire_indices,
             )
         )
     return descriptors
@@ -163,7 +174,9 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
         tile_count = int(overlap_axis.size) // int(overlap_axis.min_block_size)
         stage_count = max(2, int(reduce_op.async_collective_stage_count))
 
-        pending_tiles = _build_pending_tiles(overlap_axis, stage_count, reduce_op.buffer)
+        pending_tiles = _build_pending_tiles(
+            overlap_axis, stage_count, reduce_op.buffer, consumer_store
+        )
 
         lifecycle = reduce_op.async_collective_lifecycle
         if lifecycle is None:
@@ -182,6 +195,54 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
         regions.append(region)
 
     return regions
+
+
+def prepare_pipeline(program: Program) -> List[ManagedReductionPipelineRegion]:
+    """Shared pipeline-preparation step for estimation and code generation.
+
+    Runs managed-reduction legalization, verifier checks, and blocking
+    fallback in a single deterministic pass.  The resulting program has
+    legalized ``ManagedReductionPipelineRegion`` nodes inserted into
+    ``program.body`` so that downstream visitors (estimator, codegen) can
+    discover them via ``collect_pipeline_regions``.  Candidates that fail
+    legalization or verification are downgraded to ``blocking_collective``.
+
+    This function is idempotent: calling it on a program that already
+    contains pipeline regions is safe (existing regions are preserved
+    and no duplicates are added).
+
+    Args:
+        program: The IR program to prepare.
+
+    Returns:
+        List of successfully legalized and verified pipeline regions.
+    """
+    from mercury.ir.utils import collect_pipeline_regions
+    from mercury.ir.verify_pipeline import verify_pipeline_region
+
+    existing = program.visit(collect_pipeline_regions)
+    existing_legalized = [r for r in existing if r.legalized]
+    if existing_legalized:
+        return existing_legalized
+
+    regions = legalize_async_reductions(program)
+
+    for region in regions:
+        program.body.append(region)
+
+    verified_regions: List[ManagedReductionPipelineRegion] = []
+    for region in regions:
+        valid, errors = verify_pipeline_region(region)
+        if valid:
+            verified_regions.append(region)
+        else:
+            region.legalized = False
+            if region in program.body:
+                program.body.remove(region)
+
+    fallback_failed_async_candidates(program, verified_regions)
+
+    return verified_regions
 
 
 def fallback_failed_async_candidates(

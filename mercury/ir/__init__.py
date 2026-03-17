@@ -3,18 +3,25 @@
 """
 IR definitions for auto-ring.
 """
+
 from .elements import Axis, Buffer, grid, match_buffer
 from .nodes import (
-    Program, AxisDef, BufferMatch, GridLoop,
-    BufferStore, BufferLoad, ReduceOp
+    Program,
+    AxisDef,
+    BufferMatch,
+    GridLoop,
+    BufferStore,
+    BufferLoad,
+    ReduceOp,
 )
+from .legalization import prepare_pipeline
 from .loop_eliminating import eliminate_loops
 from .primitives import (
     identify_buffer_commands,
     check_split,
     shift,
     cut_buffer,
-    parallelize
+    parallelize,
 )
 from .calculate_memory import get_buffer_size
 
@@ -26,28 +33,26 @@ __all__ = [
     "match_buffer",
     "store_buffer",
     "load_buffer",
-    
     # From nodes
     "Program",
     "AxisDef",
     "BufferMatch",
-    "GridLoop", 
+    "GridLoop",
     "InitBlock",
     "BufferStore",
     "BufferLoad",
     "BinaryOp",
-    
     # From loop_eliminating
     "eliminate_loops",
-    
+    # From legalization
+    "prepare_pipeline",
     # From simple_parallelize
     "identify_buffer_commands",
     "check_split",
-    "shift", 
+    "shift",
     "get_inner_axis",
     "cut_buffer",
     "parallelize",
-
     # From calculate_memory
     "get_buffer_size",
 ]

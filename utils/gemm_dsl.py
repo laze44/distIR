@@ -2,6 +2,8 @@
 
 import torch
 import torch.distributed as dist
+
+
 def add_collective(tensor, op, group, dst=None):
     tensor_red = tensor.contiguous()
     if op == dist.all_reduce:
@@ -24,9 +26,7 @@ def gemm_block_size(dim: int) -> int:
     if dim <= 0:
         raise ValueError(f"GEMM dimension must be positive, got {dim}")
     if dim % 2 != 0:
-        raise ValueError(
-            f"GEMM dimensions below 32 must be even, got {dim}"
-        )
+        raise ValueError(f"GEMM dimensions below 32 must be even, got {dim}")
     return dim
 
 
@@ -51,7 +51,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
             _c = torch.matmul(_a, _b)
             block_res = _c.to(torch.float32)
             reduce(op=torch.add,
-                   buffer = reduce_buf,
+                   buffer = reduce_buf[i, j],
                    collective_op = add_collective,
                    src=block_res,
                    axis=k
@@ -68,7 +68,9 @@ def format_gemm_template(m: int, n: int, k: int) -> str:
     for parsing.
     """
     return gemm_manage_reduction.format(
-        M_LEN=m, N_LEN=n, K_LEN=k,
+        M_LEN=m,
+        N_LEN=n,
+        K_LEN=k,
         M_BLOCK=gemm_block_size(m),
         N_BLOCK=gemm_block_size(n),
         K_BLOCK=gemm_block_size(k),

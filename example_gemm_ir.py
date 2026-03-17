@@ -15,6 +15,7 @@ from mercury.backend import generate_pytorch_code
 from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
+from mercury.ir.legalization import prepare_pipeline
 from mercury.ir.utils import get_io_buffers
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
@@ -308,6 +309,7 @@ def search_gemm(
 
     estimated_programs = []
     for res_program in searched_programs:
+        prepare_pipeline(res_program)
         eliminate_loops(res_program)
         estimate = estimate_program(res_program, hw_config)
         estimated_programs.append((res_program, estimate))
