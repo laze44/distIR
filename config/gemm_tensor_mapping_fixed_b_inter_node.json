@@ -9,10 +9,16 @@
       "mapping": [
         {
           "shard": [
-            "intra_node"
-          ]
+            "inter_node"
+          ],
+          "shard_factor": 4
         },
-        "R"
+        {
+          "shard": [
+            "inter_node"
+          ],
+          "shard_factor": 4
+        }
       ]
     },
     "C": {

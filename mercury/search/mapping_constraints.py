@@ -105,6 +105,7 @@ class MatrixDimMapping:
     """Constraint for one tensor dimension."""
 
     shard_topology: Optional[Tuple[str, ...]] = None
+    shard_factor: Optional[int] = None
 
     @property
     def is_replicate(self) -> bool:
@@ -113,7 +114,10 @@ class MatrixDimMapping:
     def to_summary(self) -> str:
         if self.is_replicate:
             return "R"
-        return "S(" + ",".join(self.shard_topology) + ")"
+        topo = ",".join(self.shard_topology)
+        if self.shard_factor is not None:
+            return f"S({topo}, factor={self.shard_factor})"
+        return f"S({topo})"
 
 
 @dataclass(frozen=True)
@@ -198,11 +202,23 @@ def _parse_dim_mapping(config: object, field_name: str) -> MatrixDimMapping:
     if not isinstance(config, dict):
         raise ValueError(f"{field_name} must be 'R' or an object with key 'shard'")
 
-    if set(config.keys()) != {"shard"}:
-        raise ValueError(f"{field_name} only supports the 'shard' field")
+    allowed_keys = {"shard", "shard_factor"}
+    if not set(config.keys()).issubset(allowed_keys) or "shard" not in config:
+        raise ValueError(
+            f"{field_name} must contain the 'shard' field and optionally 'shard_factor'"
+        )
 
     tokens = _validate_topology_tokens(config["shard"], f"{field_name}.shard")
-    return MatrixDimMapping(shard_topology=tokens)
+
+    shard_factor = None
+    if "shard_factor" in config:
+        shard_factor = config["shard_factor"]
+        if not isinstance(shard_factor, int) or shard_factor < 2:
+            raise ValueError(
+                f"{field_name}.shard_factor must be an integer >= 2"
+            )
+
+    return MatrixDimMapping(shard_topology=tokens, shard_factor=shard_factor)
 
 
 def _parse_matrix_constraint(matrix_name: str, config: object) -> MatrixMappingConstraint:
@@ -533,8 +549,19 @@ def program_satisfies_tensor_mapping_constraints(
 
             expected_dims = _resolve_topology_tokens(program, dim_mapping.shard_topology)
             actual_dims = tuple(sorted(int(dim) for dim in spec[1]))
-            if actual_dims != expected_dims:
-                return False
+
+            if dim_mapping.shard_factor is None:
+                if actual_dims != expected_dims:
+                    return False
+            else:
+                if not set(actual_dims).issubset(set(expected_dims)):
+                    return False
+                mesh_shape = buffer.shard_spec.mesh.shape
+                product = 1
+                for d in actual_dims:
+                    product *= int(mesh_shape[d])
+                if product != dim_mapping.shard_factor:
+                    return False
 
     return True
 

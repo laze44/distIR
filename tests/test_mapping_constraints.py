@@ -558,3 +558,132 @@ def test_program_satisfies_logical_layout_constraints():
         logical_layout_signature_from_buffer(base.body[3].buffer),
         constraints.matrices["A"],
     )
+
+
+def test_parse_shard_factor():
+    """Verify shard_factor field parses correctly."""
+    constraints = load_tensor_mapping_constraints(
+        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+    )
+    summary = constraints.summary_by_matrix()
+    assert summary["A"] == "flexible"
+    assert summary["B"] == "fixed [S(inter_node, factor=4), S(inter_node, factor=4)]"
+    assert summary["C"] == "flexible"
+
+
+def test_parse_shard_factor_rejects_non_integer(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        {
+            "version": 1,
+            "matrices": {
+                "B": {
+                    "mode": "fixed",
+                    "mapping": [
+                        {"shard": ["inter_node"], "shard_factor": "four"},
+                        "R",
+                    ],
+                },
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="shard_factor must be an integer >= 2"):
+        load_tensor_mapping_constraints(config_path)
+
+
+def test_parse_shard_factor_rejects_value_one(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        {
+            "version": 1,
+            "matrices": {
+                "B": {
+                    "mode": "fixed",
+                    "mapping": [
+                        {"shard": ["inter_node"], "shard_factor": 1},
+                        "R",
+                    ],
+                },
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="shard_factor must be an integer >= 2"):
+        load_tensor_mapping_constraints(config_path)
+
+
+def test_parse_shard_factor_rejects_without_shard(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        {
+            "version": 1,
+            "matrices": {
+                "B": {
+                    "mode": "fixed",
+                    "mapping": [
+                        {"shard_factor": 4},
+                        "R",
+                    ],
+                },
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="must contain the 'shard' field"):
+        load_tensor_mapping_constraints(config_path)
+
+
+def test_shard_factor_match_accepts_valid_subset():
+    """shard_factor match: actual_dims subset of expected, product == factor."""
+    mesh_shape = (4, 4)
+    b_spec = [(ShardType.SHARD, [0]), (ShardType.SHARD, [1])]
+    program = _build_mock_program(
+        "sf_accept",
+        mesh_shape,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        b_spec,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        k_dim=16,
+        n_dim=16,
+    )
+    program = Program(
+        name=program.name,
+        inputs=program.inputs,
+        defaults=program.defaults,
+        outputs=program.outputs,
+        body=program.body,
+        mesh=program.mesh,
+        topology_metadata={"inter_node_dims": [0, 1]},
+    )
+
+    constraints = load_tensor_mapping_constraints(
+        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+    )
+    assert program_satisfies_tensor_mapping_constraints(program, constraints)
+
+
+def test_shard_factor_match_rejects_wrong_product():
+    """shard_factor match: actual mesh product != factor -> reject."""
+    mesh_shape = (2, 8)
+    b_spec = [(ShardType.SHARD, [0]), (ShardType.SHARD, [1])]
+    program = _build_mock_program(
+        "sf_reject",
+        mesh_shape,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        b_spec,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        k_dim=16,
+        n_dim=16,
+    )
+    program = Program(
+        name=program.name,
+        inputs=program.inputs,
+        defaults=program.defaults,
+        outputs=program.outputs,
+        body=program.body,
+        mesh=program.mesh,
+        topology_metadata={"inter_node_dims": [0, 1]},
+    )
+
+    constraints = load_tensor_mapping_constraints(
+        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+    )
+    assert not program_satisfies_tensor_mapping_constraints(program, constraints)
