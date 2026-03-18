@@ -27,7 +27,22 @@ Auto-tuner 的优化目标是：
 - loop 的 tile 大小与 mesh 尺寸对齐
 - 被 `parallelize` / `shift` 的 loop 长度需匹配对应 mesh 维度
 
+**拓扑感知 Mesh 生成 (MeshShapePolicy)：**
+不再直接基于 `world_size` 进行盲目的因子分解，而是引入 `MeshShapePolicy` 结合物理拓扑进行受控枚举。
+- **物理域划分 (TopologySpec)**：将硬件定义为多个物理域（如 `inter_node` 和 `intra_node`），每个域具有特定的连接特性（如 `clique` 全连接或 `mesh2d` 网格）。
+- **受控分解策略**：
+    - `single_dim`：物理域映射为单一逻辑维度，不进行分解。
+    - `rank_limited`：允许将物理域分解为有限数量（通常最多 2 个）的逻辑子轴，以平衡搜索覆盖度与复杂度。
+- **域感知枚举**：逻辑 mesh 维度按物理域顺序拼接，严禁跨域混合（不再产生 `mixed_dims`），确保生成的 mesh 形状在物理上是高效可实现的。
+
 配合 `reorder/join` 仍可保持较高覆盖度，同时明显缩小候选数。
+
+### 拓扑感知搜索 (Topology-aware Search)
+
+在搜索过程中，逻辑 mesh 的每个维度在生成时即携带明确的拓扑元数据。
+- **元数据直接生成**：`inter_node_dims` 和 `intra_node_dims` 在构建 mesh 形状时确定，不再依赖事后推断。
+- **通信成本对齐**：拓扑元数据直接指导 estimator 选择对应的物理链路参数（带宽/延迟），提高时延评估的准确性。
+- **搜索空间压缩**：通过排除物理上不合理（如跨节点混合维）或冗余的 mesh 形状，在保证最优解覆盖的同时显著降低了待评估的候选总数。
 
 ### 规则 3：通信原语打包
 
@@ -45,12 +60,13 @@ Auto-tuner 的优化目标是：
 每个候选都进行完整 lowering 并在真实硬件上 profile，以实测时延为准。
 在理论估算路径中，`async_collective_overlap` 采用 tile 级流水模型（warmup / steady-state / drain）而非将 collective 全量视作阻塞。
 
-**重要：async overlap 排名仅在合法化成功后生效。** estimator 优先使用 `ManagedReductionPipelineRegion` 中的合法化信息来计算 async pipeline overhead。未合法化的 async 候选不会获得 overlap 评分优势，而是退化为 `blocking_collective` 排名和 lowering。
+**重要：async overlap 排名仅在合法化成功后生效。** `estimate_program()` 和 `generate_pytorch_code()` 在评估/生成前会自动调用 `prepare_pipeline()`，确保 legalization 总是先于 ranking 和 codegen 执行。estimator 仅使用 `ManagedReductionPipelineRegion` 中的合法化信息来计算 async pipeline overhead——不存在"信任裸 ReduceOp metadata"的 fallback 路径。未合法化的 async 候选统一退化为 `blocking_collective` 排名和 lowering。
 
 合法化流程：
 1. legalization pass 检查 overlap axis tile 数、collective 参与者数、消费者可 retime 性
 2. verifier 验证 pipeline region 不变量（每 slot 至多一个在途 work、wait-before-reuse、retire-after-wait）
 3. 仅通过验证的 region 才允许使用 async pipeline 估算和 async codegen
+4. legalized pipeline region 替换原 `GridLoop.body` 中的 `ReduceOp + BufferLoad + BufferStore`，不再作为 loop 外的附加节点——消除重复 codegen 风险
 
 ### 内存约束
 
@@ -78,4 +94,4 @@ Auto-tuner 的优化目标是：
 - `interconnect.inter_node.bandwidth_gb_per_s`: 正数
 - `interconnect.inter_node.latency_us`: 非负数
 
-通信估算会根据 mesh 维度和 `num_inter_dims` 自动选择 intra-node/inter-node 的带宽与延迟参数。
+通信估算会根据 mesh 维度和显式的拓扑元数据（如 `inter_node_dims`）自动选择 intra-node/inter-node 的带宽与延迟参数。

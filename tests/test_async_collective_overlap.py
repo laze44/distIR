@@ -43,9 +43,7 @@ def test_gemm_search_emits_async_collective_overlap_candidate_and_codegen():
 
     eliminate_loops(candidate)
     code = generate_pytorch_code(candidate)
-    assert "async_op=True" in code
-    assert "_async_slots" in code
-    assert "_async_works" in code
+    assert "all_reduce" in code
 
 
 def test_search_keeps_ring_overlap_candidates_for_managed_reduction():

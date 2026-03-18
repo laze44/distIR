@@ -38,3 +38,10 @@ from .mapping_constraints import (
     resolve_topology_tokens_from_metadata,
 )
 from .reshard_estimate import estimate_reshard_time
+from .topology_policy import (
+    DomainSpec,
+    MeshShapePolicy,
+    TopologySpec,
+    make_gemm_mesh_shape_policy,
+    make_gemm_topology_spec,
+)

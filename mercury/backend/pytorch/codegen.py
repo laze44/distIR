@@ -112,7 +112,6 @@ class PyTorchCodegen:
         self.async_slot_vars = {}
         self.pipeline_regions = {}
 
-        # First, collect legalized pipeline regions
         for region in program.visit(collect_pipeline_regions):
             if region.legalized and region.reduce_op is not None:
                 reduce_op = region.reduce_op
@@ -137,30 +136,9 @@ class PyTorchCodegen:
                     "legalized": True,
                 }
 
-        # Then, collect from ReduceOp metadata (backward-compatible path)
         for reduce_op in program.visit(collect_reduce):
-            self.reduce_buffers[reduce_op.buffer.tensor] = reduce_op
-            if reduce_op.buffer.tensor in self.pipeline_regions:
-                continue
-            collective_shard_dims = tuple(self._collective_shard_dims(reduce_op))
-            if len(collective_shard_dims) == 0:
-                continue
-            if reduce_op.managed_collective_strategy != "async_collective_overlap":
-                continue
-            overlap_axis = reduce_op.async_collective_overlap_axis
-            if overlap_axis is None:
-                continue
-            stage_count = max(2, int(reduce_op.async_collective_stage_count))
-            buffer_name = reduce_op.buffer.tensor
-            self.async_collective_buffers[buffer_name] = {
-                "overlap_axis_name": overlap_axis.name,
-                "stage_count": stage_count,
-                "collective_shard_dims": collective_shard_dims,
-                "slots_name": f"{buffer_name}_async_slots",
-                "works_name": f"{buffer_name}_async_works",
-                "use_slots": False,
-                "legalized": False,
-            }
+            if reduce_op.buffer.tensor not in self.reduce_buffers:
+                self.reduce_buffers[reduce_op.buffer.tensor] = reduce_op
 
     def visit(self, node: IRNode) -> Optional[str]:
         """Visit an IR node and generate code.
@@ -227,38 +205,11 @@ class PyTorchCodegen:
                     node, "managed_collective_strategy", "blocking_collective"
                 )
                 if strategy == "async_collective_overlap":
-                    config = self.async_collective_buffers.get(tensor_name)
-                    if config is None:
-                        raise ValueError(
-                            f"Missing async collective state for reduction buffer '{tensor_name}'"
-                        )
-                    slot_var = self.async_slot_vars.get(tensor_name, "0")
-                    works_name = config["works_name"]
-                    collective_group = f"get_device_group(indices, {self.mesh_shape}, {collective_shard_dims})"
-                    lifecycle = node.async_collective_lifecycle
-                    if last_axis_cond is not None:
-                        self.emit(f"if {last_axis_cond}:")
-                        self.indent_level += 1
-                    if lifecycle is not None:
-                        self.emit(f"# {lifecycle.wait_on_reuse_op}")
-                    self.emit(f"if {works_name}[{slot_var}] is not None:")
-                    self.indent_level += 1
-                    self.emit(f"{works_name}[{slot_var}].wait()")
-                    is_legalized = config.get("legalized", False)
-                    if is_legalized:
-                        pending_name = config.get(
-                            "pending_name", f"{tensor_name}_pending"
-                        )
-                        self.emit(f"{pending_name}[{slot_var}] = None")
-                    self.indent_level -= 1
-                    if lifecycle is not None:
-                        self.emit(f"# {lifecycle.start_op}")
-                    self.emit(
-                        f"{works_name}[{slot_var}] = dist.all_reduce("
-                        f"{tensor_expr}, op=dist.ReduceOp.SUM, group={collective_group}, async_op=True)"
+                    raise ValueError(
+                        f"ReduceOp for '{tensor_name}' still has "
+                        f"async_collective_overlap after legalization; "
+                        f"expected blocking_collective or a legalized pipeline region"
                     )
-                    if last_axis_cond is not None:
-                        self.indent_level -= 1
                 else:
                     collective_stmt = (
                         f"{node.collective_op}({tensor_expr}, dist.all_reduce, "
@@ -371,24 +322,193 @@ class PyTorchCodegen:
     ) -> None:
         """Generate code for a legalized pipeline region.
 
-        The region contains a reduce_op and an optional consumer_store.  The
-        actual slot/wait/drain mechanics are handled by existing ReduceOp and
-        GridLoop codegen — this visitor emits a descriptive comment to mark the
-        legalized region boundary, then delegates to child visitors.
+        Emits the full pipeline sequence for one tile iteration:
+        1. Wait-on-reuse: if the current slot has a pending tile, wait and retire it
+        2. Local reduce: accumulate into the slot buffer
+        3. Start async all_reduce on the slot
+        4. Mark slot pending
+
+        The drain loop (wait remaining slots after the overlap loop ends)
+        is handled by ``visit_GridLoop`` using the config from
+        ``_initialize_collective_state``.
         """
-        buffer_name = (
-            node.reduce_op.buffer.tensor if node.reduce_op is not None else "?"
-        )
+        if node.reduce_op is None:
+            return
+
+        buffer_name = node.reduce_op.buffer.tensor
         overlap_name = node.overlap_axis.name if node.overlap_axis is not None else "?"
         self.emit(
             f"# --- pipeline region: {buffer_name}, "
             f"overlap={overlap_name}, stages={node.stage_count}, "
             f"tiles={node.tile_count} ---"
         )
-        if node.reduce_op is not None:
+
+        config = self.async_collective_buffers.get(buffer_name)
+        if config is None:
             self.visit(node.reduce_op)
-        if node.consumer_store is not None:
-            self.visit(node.consumer_store)
+            if node.consumer_store is not None:
+                self.visit(node.consumer_store)
+            return
+
+        slot_var = self.async_slot_vars.get(buffer_name, "0")
+
+        self._emit_async_pipeline_wait_on_reuse(node, config, slot_var)
+        self._emit_async_pipeline_reduce(node, config, slot_var)
+        self._emit_async_pipeline_start(node, config, slot_var)
+
+    def _emit_async_pipeline_wait_on_reuse(
+        self,
+        node: ManagedReductionPipelineRegion,
+        config: Dict[str, Any],
+        slot_var: str,
+    ) -> None:
+        """Emit wait-on-reuse: if the slot has a pending tile, wait and retire it."""
+        buffer_name = node.reduce_op.buffer.tensor
+        works_name = config["works_name"]
+        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+        lifecycle = node.lifecycle
+
+        if lifecycle is not None:
+            self.emit(f"# {lifecycle.wait_on_reuse_op}")
+        self.emit(f"if {works_name}[{slot_var}] is not None:")
+        self.indent_level += 1
+        self.emit(f"{works_name}[{slot_var}].wait()")
+        # Retire the completed tile
+        self._emit_async_pipeline_retire(node, config, slot_var)
+        self.emit(f"{works_name}[{slot_var}] = None")
+        self.indent_level -= 1
+
+    def _emit_async_pipeline_retire(
+        self,
+        node: ManagedReductionPipelineRegion,
+        config: Dict[str, Any],
+        slot_var: str,
+    ) -> None:
+        """Emit retire logic: read from slot, apply epilogue, write to output buffer."""
+        buffer_name = node.reduce_op.buffer.tensor
+        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+        slots_name = config["slots_name"]
+
+        if node.consumer_store is not None and node.retire_target_buffer is not None:
+            output_tensor = node.retire_target_buffer.tensor
+            output_expr = self._buffer_expr(output_tensor)
+
+            # Build index expression for the output store using pending tile coords
+            # We use pending[slot] to recover the tile identity at retire time
+            # For the retired tile, we need the indices from when it was submitted.
+            # We store (axis_var_value,) in pending and replay indexing at retire.
+            retired_slot_expr = f"{slots_name}[{slot_var}]"
+
+            if node.consumer_epilogue is not None:
+                # Apply epilogue, e.g. .to(c.dtype) → retired_val = slots[slot].to(c.dtype)
+                import ast as _ast
+
+                epilogue_src = _ast.unparse(node.consumer_epilogue.node)
+                # The epilogue references the load target variable (e.g. reduce_res).
+                # At retire time, the slot buffer IS the value, so we substitute.
+                source_name = None
+                if node.consumer_load is not None:
+                    target = node.consumer_load.target
+                    if isinstance(target, str):
+                        source_name = target
+                if source_name is not None:
+                    retired_value = epilogue_src.replace(source_name, retired_slot_expr)
+                else:
+                    retired_value = retired_slot_expr
+            else:
+                retired_value = retired_slot_expr
+
+            # Write to output at the pending tile's indices
+            self.emit(f"if {pending_name}[{slot_var}] is not None:")
+            self.indent_level += 1
+            pending_idx = f"{pending_name}[{slot_var}]"
+            self.emit(f"{output_expr}[{pending_idx}] = {retired_value}")
+            self.emit(f"{pending_name}[{slot_var}] = None")
+            self.indent_level -= 1
+
+    def _emit_async_pipeline_reduce(
+        self,
+        node: ManagedReductionPipelineRegion,
+        config: Dict[str, Any],
+        slot_var: str,
+    ) -> None:
+        """Emit the local reduce accumulation into the slot buffer."""
+        reduce_op = node.reduce_op
+        buffer_name = reduce_op.buffer.tensor
+        tensor_expr = self._buffer_expr(buffer_name)
+        indice_str = ""
+        if reduce_op.indices is not None:
+            indices = self.gen_indice(reduce_op)
+            indice_str = f"[{', '.join(indices)}]"
+
+        src = (
+            self.visit(reduce_op.src)
+            if isinstance(reduce_op.src, IRNode)
+            else str(reduce_op.src)
+        )
+
+        first_axis_cond = self._axis_first_condition(reduce_op.axes)
+        if first_axis_cond is None:
+            self.emit(f"{tensor_expr}{indice_str} = {src}")
+        else:
+            self.emit(f"if {first_axis_cond}:")
+            self.indent_level += 1
+            self.emit(f"{tensor_expr}{indice_str} = {src}")
+            self.indent_level -= 1
+            self.emit(f"else:")
+            self.indent_level += 1
+            self.emit(
+                f"{tensor_expr}{indice_str} = {reduce_op.op}({tensor_expr}{indice_str}, {src})"
+            )
+            self.indent_level -= 1
+
+    def _emit_async_pipeline_start(
+        self,
+        node: ManagedReductionPipelineRegion,
+        config: Dict[str, Any],
+        slot_var: str,
+    ) -> None:
+        """Emit the async all_reduce start and pending-tile bookkeeping."""
+        reduce_op = node.reduce_op
+        buffer_name = reduce_op.buffer.tensor
+        tensor_expr = self._buffer_expr(buffer_name)
+        works_name = config["works_name"]
+        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+        collective_shard_dims = config["collective_shard_dims"]
+        lifecycle = node.lifecycle
+
+        # Only start the collective on the last reduction-axis iteration
+        last_axis_cond = self._axis_last_condition(reduce_op.axes)
+
+        if last_axis_cond is not None:
+            self.emit(f"if {last_axis_cond}:")
+            self.indent_level += 1
+
+        collective_group = (
+            f"get_device_group(indices, {self.mesh_shape}, {collective_shard_dims})"
+        )
+        if lifecycle is not None:
+            self.emit(f"# {lifecycle.start_op}")
+        self.emit(
+            f"{works_name}[{slot_var}] = dist.all_reduce("
+            f"{tensor_expr}, op=dist.ReduceOp.SUM, group={collective_group}, async_op=True)"
+        )
+
+        # Record pending tile identity (the index expression for retire)
+        # We store the current slice expression so drain/reuse can replay it
+        if reduce_op.indices is not None:
+            output_indices = self.gen_indice(reduce_op)
+            index_str = f"{', '.join(output_indices)}"
+            self.emit(
+                f"{pending_name}[{slot_var}] = ({index_str},)"
+                if len(output_indices) == 1
+                else f"{pending_name}[{slot_var}] = ({index_str})"
+            )
+        else:
+            self.emit(f"{pending_name}[{slot_var}] = True")
+
+        if last_axis_cond is not None:
+            self.indent_level -= 1
 
     def visit_BufferMatch(self, node: BufferMatch) -> None:
         """Process buffer matching."""
@@ -609,9 +729,44 @@ class PyTorchCodegen:
                         pending_name = config.get(
                             "pending_name", f"{buffer_name}_pending"
                         )
-                        self.emit(
-                            f"{pending_name}[_slot] = None  # retire pending tile"
-                        )
+                        if (
+                            region is not None
+                            and region.consumer_store is not None
+                            and region.retire_target_buffer is not None
+                        ):
+                            slots_name = config["slots_name"]
+                            output_tensor = region.retire_target_buffer.tensor
+                            output_expr = self._buffer_expr(output_tensor)
+                            retired_slot_expr = f"{slots_name}[_slot]"
+
+                            if region.consumer_epilogue is not None:
+                                import ast as _ast
+
+                                epilogue_src = _ast.unparse(
+                                    region.consumer_epilogue.node
+                                )
+                                source_name = None
+                                if region.consumer_load is not None:
+                                    target = region.consumer_load.target
+                                    if isinstance(target, str):
+                                        source_name = target
+                                if source_name is not None:
+                                    retired_value = epilogue_src.replace(
+                                        source_name, retired_slot_expr
+                                    )
+                                else:
+                                    retired_value = retired_slot_expr
+                            else:
+                                retired_value = retired_slot_expr
+
+                            self.emit(f"if {pending_name}[_slot] is not None:")
+                            self.indent_level += 1
+                            pending_idx = f"{pending_name}[_slot]"
+                            self.emit(f"{output_expr}[{pending_idx}] = {retired_value}")
+                            self.emit(f"{pending_name}[_slot] = None")
+                            self.indent_level -= 1
+                        else:
+                            self.emit(f"{pending_name}[_slot] = None")
                     self.indent_level -= 1
                     self.indent_level -= 1
             # this is a ad-hoc solution, now we create the collective when the buffer is loaded
@@ -628,7 +783,7 @@ class PyTorchCodegen:
         self.active_ring_axes = old_active_ring_axes
         self.async_slot_vars = old_async_slot_vars
 
-    def gen_indice(self, node: Union[BufferLoad, BufferStore]) -> List:
+    def gen_indice(self, node: Union[BufferLoad, BufferStore, ReduceOp]) -> List:
         # Handle indices
         indices = []
 
@@ -687,27 +842,6 @@ class PyTorchCodegen:
         target = node.target
 
         if len(node.comm) == 0:
-            reduce_op = self.reduce_buffers.get(node.buffer.tensor)
-            if (
-                reduce_op is not None
-                and reduce_op.managed_collective_strategy == "async_collective_overlap"
-                and node.buffer.tensor in self.async_collective_buffers
-            ):
-                config = self.async_collective_buffers[node.buffer.tensor]
-                is_legalized = config.get("legalized", False)
-                if is_legalized:
-                    pass
-                else:
-                    works_name = config["works_name"]
-                    slot_var = self.async_slot_vars.get(node.buffer.tensor, "0")
-                    lifecycle = reduce_op.async_collective_lifecycle
-                    if lifecycle is not None:
-                        self.emit(f"# {lifecycle.drain_wait_op}")
-                    self.emit(f"if {works_name}[{slot_var}] is not None:")
-                    self.indent_level += 1
-                    self.emit(f"{works_name}[{slot_var}].wait()")
-                    self.emit(f"{works_name}[{slot_var}] = None")
-                    self.indent_level -= 1
             self.emit(f"{target} = {expr}")
         else:
             assert node.buffer.write == False, (
@@ -830,12 +964,20 @@ class PyTorchCodegen:
 def generate_pytorch_code(program: Program) -> str:
     """Generate PyTorch code from IR program.
 
+    Automatically runs pipeline legalization before code generation so that
+    async collective overlap candidates that pass verification are lowered
+    with proper wait-on-reuse / drain semantics.  Callers do NOT need to
+    invoke ``prepare_pipeline`` separately.
+
     Args:
         program: The IR program to convert.
 
     Returns:
         Generated PyTorch code as string.
     """
+    from mercury.ir.legalization import prepare_pipeline
+
+    prepare_pipeline(program)
     codegen = PyTorchCodegen()
     codegen.visit(program)
     return "\n".join(codegen.code_lines)

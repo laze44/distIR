@@ -143,7 +143,7 @@ class TestAsyncCandidateCodeVisibility:
     """Verify that async candidates produce visible async constructs in generated code."""
 
     def test_async_candidate_codegen_emits_async_op(self):
-        """Generated code for async candidate includes async_op=True."""
+        """Non-legalizable async candidates are downgraded to blocking all_reduce."""
         program = _build_gemm_program()
         mesh = DeviceMesh([0, 1], (2,))
         candidates = list(search(program, mesh, ["I", "J", "K"]))
@@ -162,12 +162,12 @@ class TestAsyncCandidateCodeVisibility:
         eliminate_loops(candidate)
         code = generate_pytorch_code(candidate)
 
-        assert "async_op=True" in code, (
-            "Async candidate codegen must include async_op=True"
+        assert "all_reduce" in code, (
+            "Non-legalizable async candidate should fall back to blocking all_reduce"
         )
 
     def test_async_candidate_codegen_emits_slot_arrays(self):
-        """Generated code for async candidate includes slot and work arrays."""
+        """Non-legalizable async candidates do NOT emit slot/work arrays (blocking)."""
         program = _build_gemm_program()
         mesh = DeviceMesh([0, 1], (2,))
         candidates = list(search(program, mesh, ["I", "J", "K"]))
@@ -186,8 +186,12 @@ class TestAsyncCandidateCodeVisibility:
         eliminate_loops(candidate)
         code = generate_pytorch_code(candidate)
 
-        assert "_async_slots" in code, "Code must declare async slots"
-        assert "_async_works" in code, "Code must declare async works"
+        assert "_async_slots" not in code, (
+            "Non-legalizable candidates should not have async slots"
+        )
+        assert "_async_works" not in code, (
+            "Non-legalizable candidates should not have async works"
+        )
 
     def test_legalized_candidate_codegen_emits_pending_array(self):
         """A legalized async candidate produces pending-tile tracking in codegen."""

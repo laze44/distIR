@@ -15,13 +15,13 @@ from mercury.backend import generate_pytorch_code
 from mercury.frontend.parser import IRBuilder
 from mercury.ir.distributed import DeviceMesh
 from mercury.ir.loop_eliminating import eliminate_loops
-from mercury.ir.legalization import prepare_pipeline
 from mercury.ir.utils import get_io_buffers
 from mercury.search.dump import dump
 from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.gemm_dedupe import gemm_canonical_dedupe_key
 from mercury.search.mapping_constraints import load_tensor_mapping_constraints
 from mercury.search.search import search_with_progress
+from mercury.search.topology_policy import make_gemm_mesh_shape_policy
 
 
 def _extract_template_from_file(template_name: str) -> str:
@@ -289,6 +289,8 @@ def search_gemm(
         mapping_config_path,
     )
 
+    mesh_shape_policy = make_gemm_mesh_shape_policy(inter_node, intra_node)
+
     searched_programs = list(
         search_with_progress(
             program,
@@ -300,6 +302,7 @@ def search_gemm(
             miniters=32,
             mininterval=0.5,
             dedupe_key_fn=gemm_canonical_dedupe_key,
+            mesh_shape_policy=mesh_shape_policy,
         )
     )
     # Sort for deterministic ordering (same approach as test_search_gemm.py)
@@ -309,7 +312,6 @@ def search_gemm(
 
     estimated_programs = []
     for res_program in searched_programs:
-        prepare_pipeline(res_program)
         eliminate_loops(res_program)
         estimate = estimate_program(res_program, hw_config)
         estimated_programs.append((res_program, estimate))

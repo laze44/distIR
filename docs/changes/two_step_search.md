@@ -397,3 +397,24 @@ segment 级时间模型写成：
 - canonical 导出结果必须来自最终选中的 `step-2` segment/program，而不是每个算子各自独立排序后的 rank-1 候选；
 - per-operator top-k 候选文件仅作为 debug artifact 保留，必须在 summary 中标注为 non-canonical；
 - summary 需要显式记录每条 explicit edge obligation 及其最终 ownership（standalone segment 或 consumer-side fused segment）。
+
+## Topology-Aware Mesh Shape 语义
+
+在引入 `MeshShapePolicy`（见 `mercury/search/topology_policy.py`）后，`step-1` 的 mesh shape 枚举从"基于 world size 的任意因子分解"转变为"基于物理拓扑域的受控生成"。这一变化对 layout planning 的语义产生以下影响：
+
+### 1. 物理域显式化
+Mesh 维度现在具有明确的物理含义。通过 `TopologySpec` 定义的 `inter_node` 和 `intra_node` 等物理域，在 mesh shape 生成阶段就决定了每个逻辑维度的归属。逻辑 mesh 的维度顺序严格遵循物理域的定义顺序（通常先 `inter` 后 `intra`）。
+
+### 2. 维度隔离与受控分解
+- **禁止跨域混合**：单个逻辑 mesh 维度不再允许同时包含来自不同物理域（如 inter-node 和 intra-node）的设备。
+- **受控分解 (Controlled Factorization)**：
+    - 对于 `inter_node` 域，默认采用 `rank_limited` 策略（通常限制为最多 2 个逻辑维），以支持 GEMM 等算子在跨节点维度的多维切分（如 `(4, 1)`、`(2, 2)`）。
+    - 对于 `intra_node` 域，默认采用 `single_dim` 策略，将其视为单一逻辑维，减少搜索空间冗余。
+
+### 3. 拓扑元数据直接生成
+`step-1` 生成 layout plan 时，不再通过事后推断（post-hoc inference）来识别 `inter_node_dims` 或 `intra_node_dims`，而是直接从 policy 中继承这些元数据。这消除了 `mixed_dims` 的不确定性，使得代价模型（Estimator）的评估更加稳定。
+
+### 4. 兼容性与迁移
+- `mesh_shape_policy` 是 `search()` 等接口的可选参数。若未提供，搜索将回退到旧有的任意因子分解模式。
+- 当前 `gemm_two_step_search.py` 内部仍使用 `_fixed_topology_metadata()` 硬编码逻辑，计划在未来版本中统一迁移至 `MeshShapePolicy` 语义。
+- 注意：`MeshShapePolicy` 将 `(N,)` 形状（其中 N 等于 inter_node size）分类为 inter-node 维，这与旧逻辑中对 1D mesh 的某些分类推断可能存在微小差异。

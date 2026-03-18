@@ -229,22 +229,12 @@ class TestLegalizedNoRetireAtBufferLoad:
                     )
 
     def test_non_legalized_codegen_still_waits_at_buffer_load(self):
-        """For non-legalized async buffers, BufferLoad DOES emit .wait()."""
+        """After prepare_pipeline, non-legalizable async candidates use blocking all_reduce."""
         program = _make_legalized_program()
         eliminate_loops(program)
         code = generate_pytorch_code(program)
 
-        assert "_async_works" in code, "Non-legalized path should use async works"
-        load_lines = [
-            i
-            for i, line in enumerate(code.split("\n"))
-            if "_tmp1 =" in line and "reduce_buf" in line
-        ]
-        if len(load_lines) > 0:
-            wait_found = any(".wait()" in line for line in code.split("\n"))
-            assert wait_found, (
-                "Non-legalized async path should have at least one .wait()"
-            )
+        assert "all_reduce" in code, "Blocking path should use all_reduce"
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +301,26 @@ class TestLegalizedRetireOnReuseOrDrain:
         assert re.search(r"_pending = \[None for _ in range\(\d+\)\]", code), (
             "Legalized code must initialize pending array"
         )
+
+    def test_legalized_no_immediate_wait_after_start(self):
+        """async_op=True must not be followed by .wait() for the same slot before next tile."""
+        program = _make_legalized_program()
+        regions = prepare_pipeline(program)
+        assert len(regions) > 0
+
+        code = generate_pytorch_code(program)
+        lines = code.split("\n")
+
+        for i, line in enumerate(lines):
+            if "async_op=True" in line:
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    next_line = lines[j].strip()
+                    assert not (
+                        next_line.endswith(".wait()") and "if " not in next_line
+                    ), (
+                        f"Immediate unconditional .wait() after async start "
+                        f"defeats overlap. line {j}: {next_line}"
+                    )
 
 
 # ---------------------------------------------------------------------------

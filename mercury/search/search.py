@@ -24,6 +24,7 @@ from mercury.search.mapping_constraints import (
     TensorMappingConstraints,
     program_satisfies_tensor_mapping_constraints,
 )
+from mercury.search.topology_policy import MeshShapePolicy
 
 
 MAX_AXIS_TILE_FACTOR = 16
@@ -412,6 +413,7 @@ def search(
     tensor_mapping_constraints: Optional[TensorMappingConstraints] = None,
     program_filter: Optional[Callable[[Program], bool]] = None,
     dedupe_key_fn: Optional[Callable[[Program], object]] = None,
+    mesh_shape_policy: Optional[MeshShapePolicy] = None,
 ) -> Iterator[Program]:
     """
     Search for the best schedule for a given program.
@@ -438,6 +440,11 @@ def search(
         whose key has not been seen before.  A ``None`` return from the
         callback means the candidate is not eligible for deduplication and is
         always yielded.
+
+    mesh_shape_policy : Optional[MeshShapePolicy]
+        When provided, uses topology-aware mesh shape enumeration instead of
+        blind world_size factorization.  Topology metadata is generated
+        directly from the policy rather than inferred post-hoc.
 
     Returns
     -------
@@ -514,8 +521,17 @@ def search(
         seen_keys.add(key)
         return True
 
-    def _set_metadata_and_match(program: Program, mesh: DeviceMesh) -> bool:
-        program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
+    def _set_metadata_and_match(
+        program: Program,
+        mesh: DeviceMesh,
+        mesh_shape: Optional[Tuple[int, ...]] = None,
+    ) -> bool:
+        if mesh_shape_policy is not None and mesh_shape is not None:
+            program.topology_metadata = mesh_shape_policy.topology_metadata_for_shape(
+                mesh_shape
+            )
+        else:
+            program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
         matches_constraints = program_satisfies_tensor_mapping_constraints(
             program,
             tensor_mapping_constraints,
@@ -547,7 +563,12 @@ def search(
         axes = splited_program.visit(collect_axis)
         axis_num = len(axes)
 
-        for mesh_shape in enumerate_mesh_shapes(len(origin_mesh.devices), max_dim):
+        if mesh_shape_policy is not None:
+            mesh_shapes_iter = iter(mesh_shape_policy.enumerate_shapes())
+        else:
+            mesh_shapes_iter = enumerate_mesh_shapes(len(origin_mesh.devices), max_dim)
+
+        for mesh_shape in mesh_shapes_iter:
             # try all possible mesh shapes
 
             program_shape = copy.deepcopy(splited_program)
@@ -614,9 +635,9 @@ def search(
                     # print(f"mesh_shape: {mesh_shape}")
                     # print(f"assign: {assign}")
                     for variant in _enumerate_collective_strategy_variants(program):
-                        if _set_metadata_and_match(variant, mesh) and _should_yield(
-                            variant
-                        ):
+                        if _set_metadata_and_match(
+                            variant, mesh, mesh_shape
+                        ) and _should_yield(variant):
                             yield variant
 
                     # enumerate all subset of ringable axes
@@ -660,7 +681,7 @@ def search(
                                 program
                             ):
                                 if _set_metadata_and_match(
-                                    variant, mesh
+                                    variant, mesh, mesh_shape
                                 ) and _should_yield(variant):
                                     yield variant
 
@@ -676,6 +697,7 @@ def search_with_progress(
     miniters: int = 32,
     mininterval: float = 0.5,
     dedupe_key_fn: Optional[Callable[[Program], object]] = None,
+    mesh_shape_policy: Optional[MeshShapePolicy] = None,
 ) -> Iterator[Program]:
     """Wrap ``search`` with a streaming progress bar for generated candidates.
 
@@ -687,6 +709,7 @@ def search_with_progress(
             canonical pruning key.  When provided, ``search`` keeps only the
             first candidate seen for each key and suppresses later duplicates.
             Return ``None`` from the callback to leave a candidate unpruned.
+        mesh_shape_policy: Optional topology-aware mesh shape policy.
     """
     iterator = search(
         input_program,
@@ -695,6 +718,7 @@ def search_with_progress(
         tensor_mapping_constraints,
         program_filter,
         dedupe_key_fn=dedupe_key_fn,
+        mesh_shape_policy=mesh_shape_policy,
     )
     if not show_progress:
         yield from iterator

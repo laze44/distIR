@@ -66,7 +66,7 @@
 
 ### Pipeline 合法化（Pipeline Legalization）
 
-`async_collective_overlap` 策略不再仅依靠 `ReduceOp` 上的元数据注解来声明 overlap。在 estimation 和 codegen 之前，系统执行一次 **legalization pass**：
+`async_collective_overlap` 策略不再仅依靠 `ReduceOp` 上的元数据注解来声明 overlap。`generate_pytorch_code()` 和 `estimate_program()` 在执行前自动调用 `prepare_pipeline()`，执行一次 **legalization pass**：
 
 1. 将满足条件的 async managed reduction 转化为显式的 `ManagedReductionPipelineRegion` IR 节点
 2. 合法化条件包括：
@@ -75,6 +75,9 @@
    - reduction buffer 的消费者可被 retime（仅有一条直接消费路径）
    - 无额外同迭代消费者强制提前 wait
 3. 不满足条件的 async 候选被 fallback 为 `blocking_collective`
+4. 合法化后的 pipeline region 替换原 `GridLoop.body` 中的 `ReduceOp + BufferLoad + BufferStore` 子序列，确保同一逻辑 reduction 不会被 codegen 两次
+
+不再保留"直接信任 `ReduceOp` metadata"的 backward-compatible async 路径。只有经过 legalization 的 async 候选才能获得 async lowering 和 async ranking。
 
 ### 待退役 Tile 状态（Pending-Tile Retirement）
 

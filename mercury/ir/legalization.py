@@ -7,6 +7,8 @@ them into ``ManagedReductionPipelineRegion`` nodes.  Candidates that fail
 legalization are downgraded to ``blocking_collective``.
 """
 
+import ast
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from mercury.ir.elements import Axis, Buffer
@@ -19,20 +21,122 @@ from mercury.ir.nodes import (
     ManagedReductionPipelineRegion,
     PendingTileDescriptor,
     Program,
+    PyNode,
     ReduceOp,
 )
 from mercury.ir.utils import collect_reduce
 
 
+@dataclass
+class ConsumerMatch:
+    """Result of consumer-store matching for a reduce buffer.
+
+    Carries enough information for the pipeline lowering to retire completed
+    tiles, including any epilogue expression (e.g. ``.to(c.dtype)``) that
+    must be replayed at retire time.
+
+    Args:
+        consumer_load: The ``BufferLoad`` that reads from the reduce buffer.
+        consumer_store: The ``BufferStore`` that writes to the output buffer.
+        consumer_source_name: The base variable name that links load to store
+            (e.g. ``"reduce_res"``).
+        consumer_epilogue: If the store value wraps the load target in an
+            expression (e.g. ``reduce_res.to(c.dtype)``), this holds the
+            full ``PyNode`` so codegen can replay it at retire time.
+            ``None`` when the store value is a bare variable reference.
+    """
+
+    consumer_load: BufferLoad
+    consumer_store: BufferStore
+    consumer_source_name: str
+    consumer_epilogue: Optional[PyNode] = None
+
+
+def _extract_consumer_source_name(value: Union[PyNode, str]) -> Optional[str]:
+    """Extract the base variable name from a ``BufferStore.value``.
+
+    Handles three forms:
+    - Bare string: ``"reduce_res"`` → ``"reduce_res"``
+    - ``PyNode`` wrapping a bare ``ast.Name``: ``PyNode(reduce_res)`` → ``"reduce_res"``
+    - ``PyNode`` wrapping a method call on a name:
+      ``PyNode(reduce_res.to(c.dtype))`` → ``"reduce_res"``
+
+    Returns:
+        The extracted base variable name, or ``None`` if the expression
+        structure is not recognized.
+    """
+    if isinstance(value, str):
+        return value
+
+    if not isinstance(value, PyNode):
+        return None
+
+    node = value.node
+
+    if isinstance(node, ast.Name):
+        return node.id
+
+    # Method call on a Name, e.g. reduce_res.to(c.dtype)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+        if isinstance(receiver, ast.Name):
+            return receiver.id
+
+    return None
+
+
+def _extract_consumer_epilogue(
+    value: Union[PyNode, str],
+    load_target: str,
+) -> Optional[PyNode]:
+    """Extract the epilogue expression from a ``BufferStore.value``, if any.
+
+    If *value* wraps *load_target* inside a method-call expression
+    (e.g. ``reduce_res.to(c.dtype)``), returns the full ``PyNode`` as the
+    epilogue that must be replayed at retire time.  Returns ``None`` when
+    the value is a bare variable reference (no epilogue needed).
+
+    Args:
+        value: The ``BufferStore.value`` to inspect.
+        load_target: The expected base variable name from the ``BufferLoad``.
+
+    Returns:
+        The epilogue ``PyNode``, or ``None`` if no epilogue is present.
+    """
+    if isinstance(value, str):
+        return None
+
+    if not isinstance(value, PyNode):
+        return None
+
+    node = value.node
+
+    if isinstance(node, ast.Name) and node.id == load_target:
+        return None
+
+    # Method call wrapping load_target, e.g. reduce_res.to(c.dtype)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+        if isinstance(receiver, ast.Name) and receiver.id == load_target:
+            return value
+
+    return None
+
+
 def _find_consumer_store(
     program: Program,
     reduce_buffer: Buffer,
-) -> Optional[BufferStore]:
-    """Find a direct ``BufferStore`` that loads from *reduce_buffer* and writes to an output.
+) -> Optional[ConsumerMatch]:
+    """Find the direct consumer path from *reduce_buffer* to an output store.
 
-    Returns the store node if there is exactly one direct consumer path
-    (load from reduce_buffer → store to an output-like buffer), or ``None``
-    otherwise.
+    Scans the program for exactly one ``BufferLoad`` from *reduce_buffer* and
+    a matching ``BufferStore`` whose value references the load target — either
+    directly (bare string) or through a simple wrapper expression such as
+    ``reduce_res.to(c.dtype)``.
+
+    Returns:
+        A ``ConsumerMatch`` with consumer metadata, or ``None`` if no unique
+        consumer path is found.
     """
     loads_from_reduce: List[BufferLoad] = []
     stores: List[BufferStore] = []
@@ -49,10 +153,26 @@ def _find_consumer_store(
     if len(loads_from_reduce) != 1:
         return None
 
-    load_target = loads_from_reduce[0].target
+    consumer_load = loads_from_reduce[0]
+    load_target = consumer_load.target
+    # load_target may be a str ("reduce_res") or a PyNode; normalize to str
+    if isinstance(load_target, str):
+        load_target_name = load_target
+    elif isinstance(load_target, PyNode) and isinstance(load_target.node, ast.Name):
+        load_target_name = load_target.node.id
+    else:
+        return None
+
     for store in stores:
-        if isinstance(store.value, str) and store.value == load_target:
-            return store
+        source_name = _extract_consumer_source_name(store.value)
+        if source_name is not None and source_name == load_target_name:
+            epilogue = _extract_consumer_epilogue(store.value, load_target_name)
+            return ConsumerMatch(
+                consumer_load=consumer_load,
+                consumer_store=store,
+                consumer_source_name=source_name,
+                consumer_epilogue=epilogue,
+            )
     return None
 
 
@@ -163,8 +283,8 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
             continue
 
         # Check 3: the reduction-buffer consumer can be retimed
-        consumer_store = _find_consumer_store(program, reduce_op.buffer)
-        if consumer_store is None:
+        consumer_match = _find_consumer_store(program, reduce_op.buffer)
+        if consumer_match is None:
             continue
 
         # Check 4: no additional same-iteration consumer forces an early wait
@@ -175,7 +295,7 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
         stage_count = max(2, int(reduce_op.async_collective_stage_count))
 
         pending_tiles = _build_pending_tiles(
-            overlap_axis, stage_count, reduce_op.buffer, consumer_store
+            overlap_axis, stage_count, reduce_op.buffer, consumer_match.consumer_store
         )
 
         lifecycle = reduce_op.async_collective_lifecycle
@@ -189,7 +309,15 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
             tile_count=tile_count,
             lifecycle=lifecycle,
             pending_tiles=pending_tiles,
-            consumer_store=consumer_store,
+            consumer_store=consumer_match.consumer_store,
+            consumer_load=consumer_match.consumer_load,
+            consumer_epilogue=consumer_match.consumer_epilogue,
+            retire_target_buffer=consumer_match.consumer_store.buffer,
+            retire_target_indices=[
+                idx
+                for idx in consumer_match.consumer_store.indices
+                if isinstance(idx, (int, Axis))
+            ],
             legalized=True,
         )
         regions.append(region)
@@ -197,15 +325,75 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
     return regions
 
 
+def _replace_legalized_nodes_in_loop(
+    program: Program,
+    region: ManagedReductionPipelineRegion,
+) -> bool:
+    """Replace the original ReduceOp + BufferLoad + BufferStore in the GridLoop body with *region*.
+
+    Finds the GridLoop containing *region.reduce_op* and replaces the
+    contiguous subsequence [ReduceOp, BufferLoad, BufferStore] with the
+    single ``ManagedReductionPipelineRegion`` node.
+
+    Returns ``True`` if the replacement was successful.
+    """
+    target_reduce_id = id(region.reduce_op)
+    target_load_id = (
+        id(region.consumer_load) if region.consumer_load is not None else None
+    )
+    target_store_id = (
+        id(region.consumer_store) if region.consumer_store is not None else None
+    )
+
+    grid_loops: List[GridLoop] = []
+
+    def _find_grids(node: IRNode):
+        if isinstance(node, GridLoop):
+            grid_loops.append(node)
+        return None
+
+    program.visit(_find_grids)
+
+    for grid_loop in grid_loops:
+        ids_to_remove = set()
+        reduce_found = False
+        for i, child in enumerate(grid_loop.body):
+            if id(child) == target_reduce_id:
+                reduce_found = True
+                ids_to_remove.add(id(child))
+            elif target_load_id is not None and id(child) == target_load_id:
+                ids_to_remove.add(id(child))
+            elif target_store_id is not None and id(child) == target_store_id:
+                ids_to_remove.add(id(child))
+
+        if not reduce_found:
+            continue
+
+        new_body: List[IRNode] = []
+        region_inserted = False
+        for child in grid_loop.body:
+            if id(child) in ids_to_remove:
+                if not region_inserted:
+                    new_body.append(region)
+                    region_inserted = True
+            else:
+                new_body.append(child)
+
+        grid_loop.body = new_body
+        return True
+
+    return False
+
+
 def prepare_pipeline(program: Program) -> List[ManagedReductionPipelineRegion]:
     """Shared pipeline-preparation step for estimation and code generation.
 
     Runs managed-reduction legalization, verifier checks, and blocking
-    fallback in a single deterministic pass.  The resulting program has
-    legalized ``ManagedReductionPipelineRegion`` nodes inserted into
-    ``program.body`` so that downstream visitors (estimator, codegen) can
-    discover them via ``collect_pipeline_regions``.  Candidates that fail
-    legalization or verification are downgraded to ``blocking_collective``.
+    fallback in a single deterministic pass.  Legalized regions replace
+    the original ``ReduceOp + BufferLoad + BufferStore`` subsequence inside
+    ``GridLoop.body`` so that codegen visits the region instead of the
+    original nodes.  Candidates that fail legalization or verification are
+    downgraded to ``blocking_collective``.
 
     This function is idempotent: calling it on a program that already
     contains pipeline regions is safe (existing regions are preserved
@@ -227,18 +415,17 @@ def prepare_pipeline(program: Program) -> List[ManagedReductionPipelineRegion]:
 
     regions = legalize_async_reductions(program)
 
-    for region in regions:
-        program.body.append(region)
-
     verified_regions: List[ManagedReductionPipelineRegion] = []
     for region in regions:
         valid, errors = verify_pipeline_region(region)
         if valid:
-            verified_regions.append(region)
+            replaced = _replace_legalized_nodes_in_loop(program, region)
+            if replaced:
+                verified_regions.append(region)
+            else:
+                region.legalized = False
         else:
             region.legalized = False
-            if region in program.body:
-                program.body.remove(region)
 
     fallback_failed_async_candidates(program, verified_regions)
 

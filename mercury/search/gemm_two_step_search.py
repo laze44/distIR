@@ -126,6 +126,7 @@ def _infer_gemm_problem_shape(program: Program) -> Tuple[int, int, int]:
 
 
 def _fixed_topology_metadata(mesh_shape: Tuple[int, ...]) -> Dict[str, List[int]]:
+    # TODO: migrate to MeshShapePolicy (mercury/search/topology_policy.py)
     if len(mesh_shape) == 0:
         raise ValueError("mesh_shape must be non-empty")
     if len(mesh_shape) == 1:

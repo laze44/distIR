@@ -9,8 +9,19 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 
 from mercury.ir.elements import Buffer
-from mercury.ir.nodes import BufferLoad, BufferStore, ManagedReductionPipelineRegion, Program, ReduceOp
-from mercury.ir.utils import collect_axis, collect_pipeline_regions, collect_reduce, get_element_size
+from mercury.ir.nodes import (
+    BufferLoad,
+    BufferStore,
+    ManagedReductionPipelineRegion,
+    Program,
+    ReduceOp,
+)
+from mercury.ir.utils import (
+    collect_axis,
+    collect_pipeline_regions,
+    collect_reduce,
+    get_element_size,
+)
 
 
 _DTYPE_TO_CONFIG_KEY: Dict[torch.dtype, str] = {
@@ -34,7 +45,9 @@ class EstimateResult:
         if self.compute_time_ms < 0 or self.comm_time_ms < 0 or self.total_time_ms < 0:
             raise ValueError("Estimated times must be non-negative")
         if self.total_time_ms - (self.compute_time_ms + self.comm_time_ms) > 1e-9:
-            raise ValueError("total_time_ms cannot exceed compute_time_ms + comm_time_ms")
+            raise ValueError(
+                "total_time_ms cannot exceed compute_time_ms + comm_time_ms"
+            )
 
 
 @dataclass
@@ -187,12 +200,12 @@ def _peak_flops_per_second(hw_config: Dict[str, Any], dtype: torch.dtype) -> flo
     if dtype_key is None or dtype_key not in hw_config["compute"]["peak_tflops"]:
         dtype_key = _default_dtype_key(hw_config)
     peak_tflops = _read_positive(hw_config, ["compute", "peak_tflops", dtype_key])
-    return peak_tflops * (10 ** 12)
+    return peak_tflops * (10**12)
 
 
 def _memory_bandwidth_bytes_per_second(hw_config: Dict[str, Any]) -> float:
     bandwidth_tb_per_s = _read_positive(hw_config, ["memory", "bandwidth_tb_per_s"])
-    return bandwidth_tb_per_s * (10 ** 12)
+    return bandwidth_tb_per_s * (10**12)
 
 
 def _estimate_gemm_data_bytes(program: Program) -> float:
@@ -201,12 +214,20 @@ def _estimate_gemm_data_bytes(program: Program) -> float:
     if output_buffer is None:
         raise ValueError("Program has no writable output buffer")
 
-    output_bytes = float(_buffer_numel(output_buffer) * get_element_size(output_buffer.dtype))
+    output_bytes = float(
+        _buffer_numel(output_buffer) * get_element_size(output_buffer.dtype)
+    )
     buffers = _collect_unique_buffers(program)
 
-    read_buffers = [buffer for buffer in buffers if buffer.tensor != output_buffer.tensor and buffer.read]
+    read_buffers = [
+        buffer
+        for buffer in buffers
+        if buffer.tensor != output_buffer.tensor and buffer.read
+    ]
     if len(read_buffers) < 2:
-        fallback_buffers = [buffer for buffer in buffers if buffer.tensor != output_buffer.tensor]
+        fallback_buffers = [
+            buffer for buffer in buffers if buffer.tensor != output_buffer.tensor
+        ]
         fallback_buffers.sort(key=_buffer_numel, reverse=True)
         read_buffers = fallback_buffers[:2]
     else:
@@ -258,7 +279,9 @@ def _normalize_topology_metadata(
     num_inter_dims: Optional[int],
 ) -> Dict[str, List[int]]:
     ndim = len(program.mesh.shape)
-    metadata = dict(program.topology_metadata) if program.topology_metadata is not None else {}
+    metadata = (
+        dict(program.topology_metadata) if program.topology_metadata is not None else {}
+    )
 
     if "inter_node_dims" not in metadata:
         if num_inter_dims is None:
@@ -285,11 +308,19 @@ def _normalize_topology_metadata(
 
 def _link_params(hw_config: Dict[str, Any], inter_node: bool) -> Tuple[float, float]:
     if inter_node:
-        bandwidth = _read_positive(hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]) * (10 ** 9)
-        latency_s = _read_non_negative(hw_config, ["interconnect", "inter_node", "latency_us"]) / (10 ** 6)
+        bandwidth = _read_positive(
+            hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]
+        ) * (10**9)
+        latency_s = _read_non_negative(
+            hw_config, ["interconnect", "inter_node", "latency_us"]
+        ) / (10**6)
     else:
-        bandwidth = _read_positive(hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]) * (10 ** 9)
-        latency_s = _read_non_negative(hw_config, ["interconnect", "intra_node", "latency_us"]) / (10 ** 6)
+        bandwidth = _read_positive(
+            hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]
+        ) * (10**9)
+        latency_s = _read_non_negative(
+            hw_config, ["interconnect", "intra_node", "latency_us"]
+        ) / (10**6)
     return bandwidth, latency_s
 
 
@@ -311,30 +342,32 @@ def _estimate_collective_reduce_events(
     events: List[_CommEvent] = []
     reduce_ops = program.visit(collect_reduce)
 
-    # Build the set of reduce buffers that have legalized pipeline regions
     legalized_reduce_bufs: Set[str] = set()
     pipeline_regions = program.visit(collect_pipeline_regions)
     for region in pipeline_regions:
         if region.legalized and region.reduce_op is not None:
             legalized_reduce_bufs.add(region.reduce_op.buffer.tensor)
-    has_any_legalized = len(legalized_reduce_bufs) > 0
-
     for reduce_op in reduce_ops:
         if len(reduce_op.shard_dim) == 0:
             continue
-        strategy = getattr(reduce_op, "managed_collective_strategy", "blocking_collective")
+        strategy = getattr(
+            reduce_op, "managed_collective_strategy", "blocking_collective"
+        )
         if strategy == "async_collective_overlap":
-            if has_any_legalized:
-                # Only skip if this specific reduction was legalized
-                if reduce_op.buffer.tensor in legalized_reduce_bufs:
-                    continue
-                # Otherwise, non-legalized async candidates are treated as blocking
-            else:
-                # Backward-compatible: no regions in program, trust ReduceOp metadata
+            # After prepare_pipeline(), legalized reductions are handled by
+            # _estimate_async_collective_pipeline_overhead_ms; skip them here.
+            if reduce_op.buffer.tensor in legalized_reduce_bufs:
                 continue
+            # Non-legalized async candidates fall through as blocking collectives.
 
         ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
-        shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
+        shard_dims = sorted(
+            set(
+                int(dim)
+                for dim in reduce_op.shard_dim
+                if int(dim) < len(program.mesh.shape)
+            )
+        )
         shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
         if len(shard_dims) == 0:
             continue
@@ -345,8 +378,12 @@ def _estimate_collective_reduce_events(
         if participants <= 1:
             continue
 
-        data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
-        inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
+        data_bytes = float(
+            _buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype)
+        )
+        inter_node = any(
+            _is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims
+        )
         bandwidth, latency_s = _link_params(hw_config, inter_node)
 
         rounds = 2.0 * (participants - 1.0)
@@ -372,67 +409,22 @@ def _estimate_async_collective_pipeline_overhead_ms(
     overhead_ms = 0.0
     memory_bandwidth = _memory_bandwidth_bytes_per_second(hw_config)
 
-    # Prefer legalized pipeline regions if available
     pipeline_regions = program.visit(collect_pipeline_regions)
     legalized_regions = [r for r in pipeline_regions if r.legalized]
 
-    if len(legalized_regions) > 0:
-        # Use legalized regions for estimation
-        for region in legalized_regions:
-            reduce_op = region.reduce_op
-            if reduce_op is None:
-                continue
-
-            ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
-            shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
-            shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
-            if len(shard_dims) == 0:
-                continue
-
-            participants = 1
-            for mesh_dim in shard_dims:
-                participants *= int(program.mesh.shape[mesh_dim])
-            if participants <= 1:
-                continue
-
-            tile_count = max(1, region.tile_count)
-            if tile_count < 2:
-                continue
-            stage_count = max(2, region.stage_count)
-
-            data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
-            inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
-            bandwidth, latency_s = _link_params(hw_config, inter_node)
-
-            rounds = 2.0 * (participants - 1.0)
-            transfer_factor = 2.0 * (participants - 1.0) / participants
-            tile_comm_ms = (rounds * latency_s + transfer_factor * (data_bytes / bandwidth)) * 1000.0
-            tile_compute_ms = compute_time_ms / float(tile_count)
-
-            warmup_ms = tile_compute_ms
-            steady_state_ms = float(tile_count - 1) * max(tile_compute_ms, tile_comm_ms)
-            drain_ms = tile_comm_ms
-            pipeline_total_ms = warmup_ms + steady_state_ms + drain_ms
-
-            baseline_compute_ms = float(tile_count) * tile_compute_ms
-            pipeline_overhead_ms = max(0.0, pipeline_total_ms - baseline_compute_ms)
-
-            extra_stage_bytes = float(stage_count - 1) * data_bytes
-            memory_overhead_ms = (extra_stage_bytes / memory_bandwidth) * 1000.0
-
-            overhead_ms += pipeline_overhead_ms + memory_overhead_ms
-
-        return overhead_ms
-
-    # Fallback: use ReduceOp metadata (backward-compatible path)
-    reduce_ops = program.visit(collect_reduce)
-
-    for reduce_op in reduce_ops:
-        if getattr(reduce_op, "managed_collective_strategy", "blocking_collective") != "async_collective_overlap":
+    for region in legalized_regions:
+        reduce_op = region.reduce_op
+        if reduce_op is None:
             continue
 
         ring_dims = set(int(comm.shard_dim) for comm in reduce_op.comm)
-        shard_dims = sorted(set(int(dim) for dim in reduce_op.shard_dim if int(dim) < len(program.mesh.shape)))
+        shard_dims = sorted(
+            set(
+                int(dim)
+                for dim in reduce_op.shard_dim
+                if int(dim) < len(program.mesh.shape)
+            )
+        )
         shard_dims = [dim for dim in shard_dims if dim not in ring_dims]
         if len(shard_dims) == 0:
             continue
@@ -443,18 +435,24 @@ def _estimate_async_collective_pipeline_overhead_ms(
         if participants <= 1:
             continue
 
-        tile_count = max(1, int(getattr(reduce_op, "async_collective_tile_count", 1)))
+        tile_count = max(1, region.tile_count)
         if tile_count < 2:
             continue
-        stage_count = max(2, int(getattr(reduce_op, "async_collective_stage_count", 2)))
+        stage_count = max(2, region.stage_count)
 
-        data_bytes = float(_buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype))
-        inter_node = any(_is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims)
+        data_bytes = float(
+            _buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype)
+        )
+        inter_node = any(
+            _is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims
+        )
         bandwidth, latency_s = _link_params(hw_config, inter_node)
 
         rounds = 2.0 * (participants - 1.0)
         transfer_factor = 2.0 * (participants - 1.0) / participants
-        tile_comm_ms = (rounds * latency_s + transfer_factor * (data_bytes / bandwidth)) * 1000.0
+        tile_comm_ms = (
+            rounds * latency_s + transfer_factor * (data_bytes / bandwidth)
+        ) * 1000.0
         tile_compute_ms = compute_time_ms / float(tile_count)
 
         warmup_ms = tile_compute_ms
@@ -484,7 +482,9 @@ def _estimate_ring_events(
     for node in comm_nodes:
         if not hasattr(node, "buffer") or not hasattr(node, "comm"):
             continue
-        data_bytes = float(_buffer_numel(node.buffer) * get_element_size(node.buffer.dtype))
+        data_bytes = float(
+            _buffer_numel(node.buffer) * get_element_size(node.buffer.dtype)
+        )
 
         for ring_comm in node.comm:
             shard_dim = int(getattr(ring_comm, "shard_dim", 0))
@@ -498,12 +498,16 @@ def _estimate_ring_events(
             bandwidth, latency_s = _link_params(hw_config, inter_node)
 
             rounds = float(participants - 1)
-            if isinstance(node, ReduceOp) and bool(getattr(ring_comm, "write_back", False)):
+            if isinstance(node, ReduceOp) and bool(
+                getattr(ring_comm, "write_back", False)
+            ):
                 rounds += 1.0
 
             comm_s = rounds * (latency_s + (data_bytes / bandwidth))
 
-            overlaps_compute = isinstance(node, (BufferLoad, BufferStore)) and not node.buffer.write
+            overlaps_compute = (
+                isinstance(node, (BufferLoad, BufferStore)) and not node.buffer.write
+            )
             events.append(
                 _CommEvent(
                     time_ms=comm_s * 1000.0,
@@ -535,6 +539,10 @@ def estimate_program(
     num_inter_dims: Optional[int] = None,
 ) -> EstimateResult:
     """Estimate compute and communication time for one IR program."""
+    from mercury.ir.legalization import prepare_pipeline
+
+    prepare_pipeline(program)
+
     if program.mesh is None:
         raise ValueError("Program mesh is not initialized")
 
@@ -546,7 +554,9 @@ def estimate_program(
     topology_metadata = _normalize_topology_metadata(program, num_inter_dims)
 
     compute_time_ms = _estimate_compute_time_ms(program, hw_config)
-    comm_events = _estimate_collective_reduce_events(program, hw_config, topology_metadata)
+    comm_events = _estimate_collective_reduce_events(
+        program, hw_config, topology_metadata
+    )
     comm_events.extend(_estimate_ring_events(program, hw_config, topology_metadata))
     async_pipeline_overhead_ms = _estimate_async_collective_pipeline_overhead_ms(
         program,
@@ -555,9 +565,15 @@ def estimate_program(
         compute_time_ms,
     )
 
-    comm_time_ms = sum(event.time_ms for event in comm_events) + async_pipeline_overhead_ms
-    output_buffers = {buffer.tensor for buffer in _collect_unique_buffers(program) if buffer.write}
-    total_time_ms = _estimate_total_with_overlap(compute_time_ms, comm_events, output_buffers)
+    comm_time_ms = (
+        sum(event.time_ms for event in comm_events) + async_pipeline_overhead_ms
+    )
+    output_buffers = {
+        buffer.tensor for buffer in _collect_unique_buffers(program) if buffer.write
+    }
+    total_time_ms = _estimate_total_with_overlap(
+        compute_time_ms, comm_events, output_buffers
+    )
     total_time_ms += async_pipeline_overhead_ms
 
     return EstimateResult(
