@@ -9,6 +9,7 @@ import contextlib
 import io
 import os
 import textwrap
+from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 from mercury.backend import generate_pytorch_code
@@ -21,7 +22,11 @@ from mercury.search.estimate import estimate_program, load_hardware_config
 from mercury.search.gemm_dedupe import gemm_canonical_dedupe_key
 from mercury.search.mapping_constraints import load_tensor_mapping_constraints
 from mercury.search.search import search_with_progress
-from mercury.search.topology_policy import make_gemm_mesh_shape_policy
+from mercury.search.topology_policy import (
+    compute_program_logical_shard_factors,
+    make_gemm_flat_mesh_shape_policy,
+    make_gemm_mesh_shape_policy,
+)
 
 
 def _extract_template_from_file(template_name: str) -> str:
@@ -95,6 +100,37 @@ def _n_dim_to_one_dim(n_dim_index: Tuple[int, ...], dimensions: Tuple[int, ...])
     for index, dim_size in zip(reversed(n_dim_index), reversed(dimensions)):
         one_dim_index = one_dim_index * int(dim_size) + int(index)
     return one_dim_index
+
+
+def _mapping_combination_key(
+    program,
+    constraints: "TensorMappingConstraints",
+) -> Tuple:
+    """Extract a hashable key from flexible-mode matrices' logical shard factors.
+
+    Only matrices with mode='flexible' in the constraints participate in the key.
+    Fixed-mode matrices are excluded since their mapping is predetermined.
+
+    Uses ``LogicalShardFactors`` (per-domain shard factor tuples) rather than
+    raw shard specs, so that different virtual mesh shapes producing the same
+    logical tiling are grouped together.
+    """
+    logical_factors = compute_program_logical_shard_factors(program)
+
+    key_parts: List[Any] = []
+    for tensor_label in ("A", "B", "C"):
+        matrix_constraint = constraints.get(tensor_label)
+        if matrix_constraint.mode != "flexible":
+            # Fixed-mode matrices don't participate in grouping
+            key_parts.append(None)
+            continue
+
+        lsf = logical_factors.get(tensor_label)
+        if lsf is not None and lsf.domain_factors:
+            key_parts.append(tuple(sorted(lsf.domain_factors.items())))
+        else:
+            key_parts.append(())
+    return tuple(key_parts)
 
 
 def _extract_abc_device_mapping(program) -> Dict[str, Any]:
@@ -246,6 +282,7 @@ def search_gemm(
     hw_config_path: str,
     mapping_config_path: str = "config/gemm_tensor_mapping.json",
     show_progress: bool = True,
+    flat_topology: bool = True,
 ) -> None:
     """Search all tiling/parallelism configurations and save results.
 
@@ -259,6 +296,9 @@ def search_gemm(
         top_k: Number of best estimated programs to persist.
         hw_config_path: Path to hardware configuration JSON file.
         mapping_config_path: Path to tensor mapping constraint JSON file.
+        flat_topology: When True (default), use flat mesh policy with
+            independent logical factor enumeration per axis.  When False,
+            use the legacy rank-limited factorisation policy.
     """
     if inter_node <= 0 or intra_node <= 0:
         raise ValueError("inter_node and intra_node must be positive integers")
@@ -289,7 +329,10 @@ def search_gemm(
         mapping_config_path,
     )
 
-    mesh_shape_policy = make_gemm_mesh_shape_policy(inter_node, intra_node)
+    if flat_topology:
+        mesh_shape_policy = make_gemm_flat_mesh_shape_policy(inter_node, intra_node)
+    else:
+        mesh_shape_policy = make_gemm_mesh_shape_policy(inter_node, intra_node)
 
     searched_programs = list(
         search_with_progress(
@@ -316,10 +359,21 @@ def search_gemm(
         estimate = estimate_program(res_program, hw_config)
         estimated_programs.append((res_program, estimate))
 
-    estimated_programs.sort(key=lambda item: item[1].total_time_ms)
+    # Group by mapping combination (only flexible-mode matrices in the key)
+    groups: Dict[Tuple, List] = defaultdict(list)
+    for res_program, estimate in estimated_programs:
+        key = _mapping_combination_key(res_program, tensor_mapping_constraints)
+        groups[key].append((res_program, estimate))
 
-    save_count = min(top_k, len(estimated_programs))
-    selected_programs = estimated_programs[:save_count]
+    # Sort each group and select top-k per group
+    selected_programs: List[Tuple] = []
+    for key in sorted(groups.keys(), key=str):
+        group = groups[key]
+        group.sort(key=lambda item: item[1].total_time_ms)
+        group_save_count = min(top_k, len(group))
+        selected_programs.extend(group[:group_save_count])
+
+    save_count = len(selected_programs)
 
     result_dir = os.path.join(
         output_dir,
@@ -332,9 +386,10 @@ def search_gemm(
             f"GEMM Search Results: M={m}, N={n}, K={k}, "
             f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
         ),
-        f"Requested top_k: {top_k}",
+        f"Requested top_k (per mapping combination): {top_k}",
         f"Total programs searched: {len(searched_programs)}",
-        f"Top-k saved: {save_count}",
+        f"Mapping combinations found: {len(groups)}",
+        f"Total programs saved: {save_count}",
         f"Hardware config: {hw_config['name']}",
         f"Tensor mapping config: {mapping_config_path}",
         "",
@@ -375,6 +430,22 @@ def search_gemm(
             f.write(ir_text)
 
         summary_lines.append(f"Program {idx + 1} (Rank {idx + 1}):")
+        mapping_key = _mapping_combination_key(res_program, tensor_mapping_constraints)
+        mapping_label_parts = []
+        for tensor_idx, tensor_label in enumerate(("A", "B", "C")):
+            part = mapping_key[tensor_idx]
+            if part is None:
+                mapping_label_parts.append(f"{tensor_label}=fixed")
+            elif not part:
+                mapping_label_parts.append(f"{tensor_label}=replicated")
+            else:
+                factor_strs = []
+                for domain_label, factor_tuple in part:
+                    factor_strs.append(f"{domain_label}={factor_tuple}")
+                mapping_label_parts.append(
+                    f"{tensor_label}=[{', '.join(factor_strs)}]"
+                )
+        summary_lines.append(f"  Mapping: {' '.join(mapping_label_parts)}")
         summary_lines.append(f"  Code: {code_filename}")
         summary_lines.append(f"  IR:   {ir_filename}")
         summary_lines.append(f"  JSON rank field: {idx + 1}")
@@ -409,6 +480,26 @@ def search_gemm(
                         f"      device {device_id}, mesh_coord={device_info['mesh_coord']}: "
                         + "; ".join(dim_segments)
                     )
+        # Logical shard factors — per-matrix, per-domain tiling description
+        logical_factors = compute_program_logical_shard_factors(res_program)
+        if logical_factors:
+            summary_lines.append("  Logical Shard Factors:")
+            for matrix_name in ("A", "B", "C"):
+                lsf = logical_factors.get(matrix_name)
+                if lsf is not None:
+                    summary_lines.append(f"    {matrix_name}: {lsf.to_summary()}")
+
+        # Add logical factors inline alongside the Mapping line
+        logical_factor_parts = []
+        for tensor_label in ("A", "B", "C"):
+            lsf = logical_factors.get(tensor_label) if logical_factors else None
+            if lsf is not None:
+                logical_factor_parts.append(f"{tensor_label}={lsf.to_summary()}")
+            else:
+                logical_factor_parts.append(f"{tensor_label}=n/a")
+        summary_lines.append(
+            f"  Logical Factors: {' '.join(logical_factor_parts)}"
+        )
         summary_lines.append("")
 
     summary_path = os.path.join(result_dir, "summary.txt")
@@ -420,7 +511,7 @@ def search_gemm(
         f"with inter_node={inter_node}, intra_node={intra_node} "
         f"(world_size={world_size})"
     )
-    print(f"Saved top-{save_count} program(s) ranked by estimated total time")
+    print(f"Saved top-{top_k} program(s) per mapping combination ({len(groups)} combinations, {save_count} total)")
     print(f"Results saved to: {result_dir}/")
     print(f"Summary: {summary_path}")
 
@@ -484,6 +575,15 @@ def main() -> None:
         action="store_true",
         help="Disable dynamic progress bars during candidate generation",
     )
+    parser.add_argument(
+        "--no-flat-topology",
+        action="store_true",
+        help=(
+            "Disable flat topology mode.  By default, the search uses "
+            "independent logical factor enumeration per axis.  This flag "
+            "reverts to the legacy rank-limited mesh factorisation."
+        ),
+    )
     args = parser.parse_args()
     search_gemm(
         args.m,
@@ -496,6 +596,7 @@ def main() -> None:
         args.hw_config,
         args.mapping_config,
         not args.no_progress,
+        flat_topology=not args.no_flat_topology,
     )
 
 

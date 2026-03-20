@@ -109,6 +109,15 @@ def gemm_canonical_dedupe_key(program: Program) -> Optional[object]:
 
     Returns ``None`` when the candidate does not match the safe
     blocking-collective GEMM pattern, leaving it unpruned.
+
+    Note on logical shard factors: ``ExactLayoutSignature`` (captured
+    via ``_layout_signature``) already implicitly encodes the logical
+    shard factors for each buffer, because the combination of
+    ``mesh_shape``, ``local_shape``, and ``shard_specs`` fully
+    determines the per-dimension shard factor breakdown.  Therefore
+    no additional key term is needed for ``LogicalShardFactors``
+    deduplication — any two candidates with identical layout signatures
+    will necessarily have identical logical factors.
     """
     buffers = _find_gemm_boundary_buffers(program)
     if buffers is None:

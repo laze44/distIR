@@ -687,3 +687,95 @@ def test_shard_factor_match_rejects_wrong_product():
         "config/gemm_tensor_mapping_fixed_b_inter_node.json"
     )
     assert not program_satisfies_tensor_mapping_constraints(program, constraints)
+
+
+def test_shard_factor_match_logical_factors_consistent():
+    """Verify shard_factor constraint matching is consistent with logical factor computation."""
+    from mercury.search.topology_policy import compute_program_logical_shard_factors
+
+    mesh_shape = (4, 4)
+    b_spec = [(ShardType.SHARD, [0]), (ShardType.SHARD, [1])]
+    program = _build_mock_program(
+        "sf_logical_consistent",
+        mesh_shape,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        b_spec,
+        [ShardType.REPLICATE, ShardType.REPLICATE],
+        k_dim=16,
+        n_dim=16,
+    )
+    program = Program(
+        name=program.name,
+        inputs=program.inputs,
+        defaults=program.defaults,
+        outputs=program.outputs,
+        body=program.body,
+        mesh=program.mesh,
+        topology_metadata={"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []},
+    )
+
+    # This program satisfies the fixed_b_inter_node constraint (factor=4 per dim)
+    constraints = load_tensor_mapping_constraints(
+        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+    )
+    assert program_satisfies_tensor_mapping_constraints(program, constraints)
+
+    # Logical factors should show inter_node=(4, 4) for B
+    logical_factors = compute_program_logical_shard_factors(program)
+    b_factors = logical_factors.get("B")
+    assert b_factors is not None
+    assert b_factors.domain_factors.get("inter_node") == (4, 4)
+    assert b_factors.total_factor("inter_node") == 16
+
+
+def test_logical_factor_constraint_matching():
+    """Test the program_satisfies_logical_factor_constraints() API."""
+    from mercury.search.mapping_constraints import (
+        program_satisfies_logical_factor_constraints,
+    )
+
+    mesh_shape = (4, 2)
+    a_spec = [(ShardType.SHARD, [0]), ShardType.REPLICATE]
+    b_spec = [ShardType.REPLICATE, (ShardType.SHARD, [1])]
+    c_spec = [(ShardType.SHARD, [0]), (ShardType.SHARD, [1])]
+    program = _build_mock_program(
+        "logical_factor_test",
+        mesh_shape,
+        a_spec,
+        b_spec,
+        c_spec,
+    )
+    program = Program(
+        name=program.name,
+        inputs=program.inputs,
+        defaults=program.defaults,
+        outputs=program.outputs,
+        body=program.body,
+        mesh=program.mesh,
+        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []},
+    )
+
+    # A is sharded on dim 0 via inter_node (factor 4)
+    assert program_satisfies_logical_factor_constraints(
+        program, {"A": {"inter_node": (4,)}}
+    )
+
+    # B is sharded on dim 1 via intra_node (factor 2)
+    assert program_satisfies_logical_factor_constraints(
+        program, {"B": {"intra_node": (2,)}}
+    )
+
+    # C is sharded on both domains
+    assert program_satisfies_logical_factor_constraints(
+        program, {"C": {"inter_node": (4,), "intra_node": (2,)}}
+    )
+
+    # Wrong factor should fail
+    assert not program_satisfies_logical_factor_constraints(
+        program, {"A": {"inter_node": (2,)}}
+    )
+
+    # Wrong domain should fail
+    assert not program_satisfies_logical_factor_constraints(
+        program, {"A": {"intra_node": (4,)}}
+    )

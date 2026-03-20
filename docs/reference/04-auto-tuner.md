@@ -44,6 +44,28 @@ Auto-tuner 的优化目标是：
 - **通信成本对齐**：拓扑元数据直接指导 estimator 选择对应的物理链路参数（带宽/延迟），提高时延评估的准确性。
 - **搜索空间压缩**：通过排除物理上不合理（如跨节点混合维）或冗余的 mesh 形状，在保证最优解覆盖的同时显著降低了待评估的候选总数。
 
+### 逻辑分片因子 (Logical Shard Factors)
+
+`MeshShapePolicy.enumerate_shapes()` 生成的 mesh 形状（如 `(8, 2)`、`(4, 4)`）是**搜索枚举工件**，它们是对物理拓扑的因子分解，用于遍历组合切分空间，**不是**物理拓扑本身的描述。
+
+**`LogicalShardFactors`** 提供了每个 buffer 在每个物理域上的真实切分因子描述：
+- 从搜索枚举 mesh 的每个维度，通过 `topology_metadata` 映射回对应的物理域（如 `inter_node`）
+- 将每个 buffer 维度上的 shard spec 所引用的 mesh 维度的大小，按物理域汇聚成因子元组
+
+**示例**：对于 `inter_node=16, intra_node=1` 的物理拓扑，搜索可能产生 mesh 形状 `(8, 2)`（两个维度均属于 `inter_node`）。若矩阵 `A` 的 shard spec 为 `[S(0), S(1)]`，则其逻辑分片因子为：
+
+```
+A: inter_node=(8, 2)   # dim 0 被 inter_node 分成 8 份，dim 1 被分成 2 份
+```
+
+这意味着 `A` 在 `inter_node` 域上总共被分成 16 份，但具体的分法是行方向 8 份、列方向 2 份。
+
+**核心函数**：
+- `compute_buffer_logical_shard_factors()` — 为单个 buffer 计算逻辑分片因子
+- `compute_program_logical_shard_factors()` — 为 program 中的所有边界 buffer 计算因子
+- `logical_shard_factor_for_dim()` — 计算单个 buffer 维度在指定物理域上的有效分片因子
+- `program_satisfies_logical_factor_constraints()` — 基于逻辑因子进行约束匹配
+
 ### 规则 3：通信原语打包
 
 实践中将 `parallelize/shift` 与对应 `shard/replicate` 打包生成。

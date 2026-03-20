@@ -32,16 +32,21 @@ from .mapping_constraints import (
     logical_layout_signature_from_buffer,
     load_operator_tensor_mapping_constraints,
     load_tensor_mapping_constraints,
+    logical_shard_factor_for_dim,
     program_satisfies_logical_layout_constraints,
     program_satisfies_exact_layout_constraints,
+    program_satisfies_logical_factor_constraints,
     program_satisfies_tensor_mapping_constraints,
     resolve_topology_tokens_from_metadata,
 )
 from .reshard_estimate import estimate_reshard_time
 from .topology_policy import (
     DomainSpec,
+    LogicalShardFactors,
     MeshShapePolicy,
     TopologySpec,
+    compute_buffer_logical_shard_factors,
+    compute_program_logical_shard_factors,
     make_gemm_mesh_shape_policy,
     make_gemm_topology_spec,
 )

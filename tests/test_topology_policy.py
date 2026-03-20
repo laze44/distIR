@@ -14,13 +14,18 @@ from mercury.search.gemm_dedupe import gemm_canonical_dedupe_key
 from mercury.search.search import enumerate_mesh_shapes, search, search_with_progress
 from mercury.search.topology_policy import (
     DomainSpec,
+    FlatMeshShapePolicy,
     MeshShapePolicy,
     TopologySpec,
     _factorize_rank_limited,
     _factorize_single_dim,
     _ordered_divisor_pairs,
+    compute_buffer_logical_shard_factors,
+    compute_program_logical_shard_factors,
     enumerate_domain_shapes,
     enumerate_topology_mesh_shapes,
+    LogicalShardFactors,
+    make_gemm_flat_mesh_shape_policy,
     make_gemm_mesh_shape_policy,
     make_gemm_topology_spec,
     topology_metadata_for_shape,
@@ -659,3 +664,296 @@ class TestPhase4TwoStepAlignment:
                 f"Mismatch for shape {shape}"
             )
             assert fixed["mixed_dims"] == policy_meta["mixed_dims"]
+
+
+class TestLogicalShardFactors:
+    """Unit tests for LogicalShardFactors and compute helpers."""
+
+    def test_replicated_buffer_has_no_factors(self):
+        # GIVEN a fully replicated buffer (all specs are R)
+        specs = (("R", ()), ("R", ()))
+        mesh_shape = (4, 2)
+        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+
+        factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
+        assert factors.domain_factors == {}
+        assert factors.to_summary() == "replicated"
+
+    def test_single_dim_shard_on_inter_node(self):
+        # GIVEN buffer sharded on dim 0 via mesh dim 0 (inter_node)
+        specs = (("S", (0,)), ("R", ()))
+        mesh_shape = (4, 2)
+        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+
+        factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
+        assert factors.domain_factors == {"inter_node": (4,)}
+        assert factors.total_factor("inter_node") == 4
+        assert factors.total_factor("intra_node") == 1
+
+    def test_two_dim_shard_on_inter_node(self):
+        # GIVEN buffer sharded on dim 0 via mesh dim 0, dim 1 via mesh dim 1
+        # WHEN mesh (8, 2) with both dims belonging to inter_node
+        specs = (("S", (0,)), ("S", (1,)))
+        mesh_shape = (8, 2)
+        metadata = {"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []}
+
+        factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
+        assert factors.domain_factors == {"inter_node": (8, 2)}
+        assert factors.total_factor("inter_node") == 16
+
+    def test_cross_domain_shard(self):
+        # GIVEN buffer sharded dim 0 on inter (dim 0), dim 1 on intra (dim 1)
+        specs = (("S", (0,)), ("S", (1,)))
+        mesh_shape = (4, 2)
+        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+
+        factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
+        assert factors.domain_factors == {"inter_node": (4,), "intra_node": (2,)}
+        assert factors.total_factor("inter_node") == 4
+        assert factors.total_factor("intra_node") == 2
+
+    def test_multi_mesh_dim_on_one_tensor_dim(self):
+        # GIVEN buffer with one tensor dim sharded across mesh dims 0 and 1
+        # (both belonging to inter_node), e.g. S(0,1) on dim 0
+        specs = (("S", (0, 1)), ("R", ()))
+        mesh_shape = (4, 4)
+        metadata = {"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []}
+
+        factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
+        # Both mesh dims contribute to inter_node
+        assert factors.domain_factors == {"inter_node": (4, 4)}
+        assert factors.total_factor("inter_node") == 16
+
+    def test_summary_format(self):
+        lsf = LogicalShardFactors(domain_factors={"inter_node": (2, 8)})
+        assert lsf.to_summary() == "inter_node=(2, 8)"
+
+    def test_empty_factors_summary(self):
+        lsf = LogicalShardFactors(domain_factors={})
+        assert lsf.to_summary() == "replicated"
+
+    def test_multi_domain_summary_sorted(self):
+        lsf = LogicalShardFactors(
+            domain_factors={"intra_node": (2,), "inter_node": (4,)}
+        )
+        summary = lsf.to_summary()
+        # Should be sorted by domain label
+        assert summary.index("inter_node") < summary.index("intra_node")
+
+    def test_inter16_logical_factor_coverage(self):
+        """Integration: inter_node=16 search produces diverse A tilings."""
+        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        program = _parse_gemm_program(256, 256, 256)
+        devices = list(range(16))
+        mesh = DeviceMesh(devices, (16,))
+
+        candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                mesh_shape_policy=policy,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
+            )
+        )
+        assert len(candidates) > 0
+
+        a_factor_patterns: Set[Tuple[int, ...]] = set()
+        for cand in candidates:
+            logical_factors = compute_program_logical_shard_factors(cand)
+            a_factors = logical_factors.get("A")
+            if a_factors is not None:
+                inter_tuple = a_factors.domain_factors.get("inter_node", ())
+                if inter_tuple:
+                    a_factor_patterns.add(inter_tuple)
+
+        # With inter_node=16 and mesh shapes (16,), (8,2), (4,4),
+        # we should see diverse A tiling patterns
+        assert len(a_factor_patterns) >= 2, (
+            f"Expected diverse A tiling patterns, got {a_factor_patterns}"
+        )
+
+
+class TestFlatMeshShapePolicy:
+    """Tests for FlatMeshShapePolicy and the flat search path."""
+
+    def test_flat_policy_enumerate_shapes_single_domain(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        shapes = policy.enumerate_shapes()
+        assert shapes == [(16,)]
+
+    def test_flat_policy_enumerate_shapes_two_domains(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=2)
+        shapes = policy.enumerate_shapes()
+        assert shapes == [(4, 2)]
+
+    def test_flat_policy_is_flat_mesh_shape_policy(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        assert isinstance(policy, FlatMeshShapePolicy)
+        assert isinstance(policy, MeshShapePolicy)
+
+    def test_flat_topology_metadata_single_domain(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        # Virtual mesh (4, 4) -> both dims belong to inter_node
+        meta = policy.topology_metadata_for_shape((4, 4))
+        assert meta["inter_node_dims"] == [0, 1]
+        assert meta["intra_node_dims"] == []
+        assert meta["mixed_dims"] == []
+
+    def test_flat_topology_metadata_two_domains(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=2)
+        # Virtual mesh (2, 2, 2) -> first two dims are inter (2*2=4), third is intra
+        meta = policy.topology_metadata_for_shape((2, 2, 2))
+        assert meta["inter_node_dims"] == [0, 1]
+        assert meta["intra_node_dims"] == [2]
+        assert meta["mixed_dims"] == []
+
+    def test_flat_topology_metadata_single_dim(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        meta = policy.topology_metadata_for_shape((16,))
+        assert meta["inter_node_dims"] == [0]
+        assert meta["intra_node_dims"] == []
+
+    def test_flat_search_produces_candidates(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=1)
+        program = _parse_gemm_program(256, 256, 256)
+        devices = list(range(4))
+        mesh = DeviceMesh(devices, (4,))
+
+        candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                mesh_shape_policy=policy,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
+            )
+        )
+        assert len(candidates) > 0
+
+    def test_flat_search_all_have_topology_metadata(self):
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=1)
+        program = _parse_gemm_program(256, 256, 256)
+        devices = list(range(4))
+        mesh = DeviceMesh(devices, (4,))
+
+        candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                mesh_shape_policy=policy,
+            )
+        )
+        for cand in candidates:
+            assert cand.topology_metadata is not None
+            assert "inter_node_dims" in cand.topology_metadata
+            assert cand.topology_metadata["mixed_dims"] == []
+
+    def test_flat_search_with_fixed_b_constraint_inter16(self):
+        """Core test: flat policy + B fixed factor=4,4 on inter_node=16."""
+        from mercury.search.mapping_constraints import (
+            load_tensor_mapping_constraints,
+            program_satisfies_tensor_mapping_constraints,
+        )
+
+        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        program = _parse_gemm_program(256, 256, 256)
+        devices = list(range(16))
+        mesh = DeviceMesh(devices, (16, 1))
+
+        constraints = load_tensor_mapping_constraints(
+            "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        )
+
+        candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                tensor_mapping_constraints=constraints,
+                mesh_shape_policy=policy,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
+            )
+        )
+
+        assert len(candidates) > 0
+
+        # All must satisfy constraints
+        for cand in candidates:
+            assert program_satisfies_tensor_mapping_constraints(cand, constraints)
+
+        # A should have more than 1 inter_node factor pattern
+        a_factor_patterns: Set[Tuple[int, ...]] = set()
+        for cand in candidates:
+            factors = compute_program_logical_shard_factors(cand)
+            a_factors = factors.get("A")
+            if a_factors is not None:
+                inter_tuple = a_factors.domain_factors.get("inter_node", ())
+                if inter_tuple:
+                    a_factor_patterns.add(inter_tuple)
+
+        assert len(a_factor_patterns) >= 2, (
+            f"Flat policy should unlock more A tiling diversity, "
+            f"but got only {a_factor_patterns}"
+        )
+
+    def test_flat_search_more_diverse_than_old_policy(self):
+        """Flat policy should produce at least as diverse A tilings as old."""
+        from mercury.search.mapping_constraints import (
+            load_tensor_mapping_constraints,
+        )
+
+        program = _parse_gemm_program(256, 256, 256)
+        devices = list(range(16))
+        mesh = DeviceMesh(devices, (16, 1))
+
+        constraints = load_tensor_mapping_constraints(
+            "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        )
+
+        # Flat policy
+        flat_policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        flat_candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                tensor_mapping_constraints=constraints,
+                mesh_shape_policy=flat_policy,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
+            )
+        )
+
+        # Old policy
+        old_policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        old_candidates = list(
+            search(
+                program,
+                mesh,
+                ["I", "J", "K"],
+                tensor_mapping_constraints=constraints,
+                mesh_shape_policy=old_policy,
+                dedupe_key_fn=gemm_canonical_dedupe_key,
+            )
+        )
+
+        # Collect A factor patterns
+        def _collect_a_patterns(candidates):
+            patterns = set()
+            for cand in candidates:
+                factors = compute_program_logical_shard_factors(cand)
+                a_factors = factors.get("A")
+                if a_factors is not None:
+                    inter_tuple = a_factors.domain_factors.get("inter_node", ())
+                    if inter_tuple:
+                        patterns.add(inter_tuple)
+            return patterns
+
+        flat_a_patterns = _collect_a_patterns(flat_candidates)
+        old_a_patterns = _collect_a_patterns(old_candidates)
+
+        assert len(flat_a_patterns) >= len(old_a_patterns), (
+            f"Flat should be at least as diverse: flat={flat_a_patterns} "
+            f"vs old={old_a_patterns}"
+        )

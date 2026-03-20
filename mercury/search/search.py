@@ -24,7 +24,7 @@ from mercury.search.mapping_constraints import (
     TensorMappingConstraints,
     program_satisfies_tensor_mapping_constraints,
 )
-from mercury.search.topology_policy import MeshShapePolicy
+from mercury.search.topology_policy import FlatMeshShapePolicy, MeshShapePolicy
 
 
 MAX_AXIS_TILE_FACTOR = 16
@@ -245,6 +245,304 @@ def _collective_shard_dims(reduce_op, mesh_ndim: int) -> List[int]:
         )
     )
     return shard_dims
+
+
+# ---------------------------------------------------------------------------
+# Logical-factor enumeration helpers for flat mesh policies
+# ---------------------------------------------------------------------------
+
+
+def _valid_axis_factors(axis: Axis, domain_size: int) -> List[int]:
+    """Return all valid shard factors for *axis* within a domain of *domain_size*.
+
+    A factor ``f`` is valid when:
+    - ``f`` divides ``axis.size``
+    - ``axis.size / f >= axis.min_block_size``
+    - ``f`` divides ``domain_size``
+    - ``f <= MAX_AXIS_TILE_FACTOR`` (unless ``f == axis.size``)
+
+    For small axes (size < 32 and min_block_size == size), only factor 1
+    and factor 2 (if even) are allowed, matching ``enumerate_axis_split``.
+    """
+    factors: List[int] = [1]
+
+    if axis.size < 32 and axis.min_block_size == axis.size:
+        if axis.size % 2 == 0 and axis.size >= 2 and domain_size % 2 == 0:
+            factors.append(2)
+        return factors
+
+    max_factor = min(MAX_AXIS_TILE_FACTOR, axis.size)
+    for f in range(2, max_factor + 1):
+        if (
+            axis.size % f == 0
+            and axis.size // f >= axis.min_block_size
+            and domain_size % f == 0
+        ):
+            factors.append(f)
+    return factors
+
+
+def _enumerate_logical_factor_assignments(
+    axes: List[Axis],
+    domain_size: int,
+) -> Iterator[List[int]]:
+    """Enumerate per-axis logical shard factor combinations for a domain.
+
+    Yields lists of length ``len(axes)`` where ``factors[i]`` is the shard
+    factor assigned to ``axes[i]``.  The product of all factors must divide
+    ``domain_size``.
+
+    This replaces the role of ``enumerate_mesh_assignment`` in the flat
+    search path: instead of assigning contiguous mesh dim ranges to axes,
+    each axis independently chooses a shard factor.
+    """
+    per_axis_factors = [_valid_axis_factors(ax, domain_size) for ax in axes]
+
+    for combo in itertools.product(*per_axis_factors):
+        product = 1
+        for f in combo:
+            product *= f
+        if domain_size % product == 0:
+            yield list(combo)
+
+
+def _build_virtual_mesh_shape(
+    factor_list: List[int],
+) -> Tuple[Tuple[int, ...], List[Tuple[int, int]]]:
+    """Build a virtual mesh shape and axis assignment from factor list.
+
+    Given a factor list (one per axis), constructs a virtual mesh shape
+    containing only the non-1 factors, and returns the corresponding
+    mesh assignment list for ``parallelize`` calls.
+
+    Returns:
+        (virtual_mesh_shape, assignment_list) where assignment_list has
+        one ``(start_dim, num_dims)`` entry per axis.
+    """
+    virtual_dims: List[int] = []
+    assign: List[Tuple[int, int]] = []
+    dim_offset = 0
+
+    for factor in factor_list:
+        if factor > 1:
+            virtual_dims.append(factor)
+            assign.append((dim_offset, 1))
+            dim_offset += 1
+        else:
+            assign.append((0, 0))
+
+    return tuple(virtual_dims) if virtual_dims else (1,), assign
+
+
+def _search_flat_path(
+    splited_program: Program,
+    origin_mesh: DeviceMesh,
+    all_axes: List[Axis],
+    flat_policy: "FlatMeshShapePolicy",
+    _set_metadata_and_match: "Callable",
+    _should_yield: "Callable",
+) -> Iterator[Program]:
+    """Flat search path: enumerate logical shard factors per domain.
+
+    For each domain with size > 1, independently enumerate shard factor
+    combinations for all axes.  For each combination, construct a virtual
+    mesh and run the standard parallelize + shift flow.
+    """
+    topology = flat_policy.topology
+
+    # Collect domain sizes and labels for domains with size > 1
+    active_domains: List[Tuple[str, int]] = []
+    for domain, label in zip(topology.domains, topology.domain_labels):
+        if domain.size > 1:
+            active_domains.append((label, domain.size))
+
+    if len(active_domains) == 0:
+        # Single-device case: yield just the base program
+        program = copy.deepcopy(splited_program)
+        mesh = origin_mesh.reshape((1,))
+        init_distributed(program, mesh)
+        if _set_metadata_and_match(program, mesh, (1,)):
+            if _should_yield(program):
+                yield program
+        return
+
+    # For each domain, enumerate factor assignments over all axes.
+    # For multi-domain case, the virtual mesh is the concatenation of
+    # per-domain virtual dims.
+    per_domain_factor_lists: List[List[List[int]]] = []
+    for _label, domain_size in active_domains:
+        domain_factors = list(
+            _enumerate_logical_factor_assignments(all_axes, domain_size)
+        )
+        per_domain_factor_lists.append(domain_factors)
+
+    for domain_combo in itertools.product(*per_domain_factor_lists):
+        # domain_combo is a tuple of factor lists, one per active domain
+        # Check: no axis is sharded more than once across domains on the
+        # *same tensor dimension* — but since each axis maps to exactly
+        # one tensor dimension, having factor > 1 on the same axis in
+        # multiple domains is fine (it compounds).  However, the total
+        # factor per axis across all domains must still allow valid
+        # parallelize calls.
+
+        # Build virtual mesh shape: concatenate per-domain virtual dims
+        virtual_dims: List[int] = []
+        per_axis_assign: List[List[Tuple[int, int]]] = [
+            [] for _ in range(len(all_axes))
+        ]
+        dim_offset = 0
+
+        for domain_idx, factor_list in enumerate(domain_combo):
+            for axis_idx, factor in enumerate(factor_list):
+                if factor > 1:
+                    virtual_dims.append(factor)
+                    per_axis_assign[axis_idx].append((dim_offset, 1))
+                    dim_offset += 1
+
+        if len(virtual_dims) == 0:
+            virtual_mesh_shape = (1,)
+        else:
+            virtual_mesh_shape = tuple(virtual_dims)
+
+        # Check that virtual mesh product divides total devices
+        vm_product = 1
+        for v in virtual_mesh_shape:
+            vm_product *= v
+        if vm_product > len(origin_mesh.devices):
+            continue
+
+        # Reshape origin mesh to virtual shape
+        # Need to pad with 1s if vm_product < total devices
+        # Actually, the virtual mesh must have the same number of devices.
+        # If some devices are not used, we need to handle that.
+        # For now, only yield when vm_product == total devices.
+        # (Partial use = devices would be replicated, but that's handled
+        #  by the standard search path already.)
+        if vm_product != len(origin_mesh.devices):
+            continue
+
+        mesh = origin_mesh.reshape(virtual_mesh_shape)
+
+        program_shape = copy.deepcopy(splited_program)
+        init_distributed(program_shape, mesh)
+
+        # Build flattened assignment: for each axis, merge dims from all domains
+        flat_assign: List[Tuple[int, int]] = []
+        for axis_idx in range(len(all_axes)):
+            domain_assigns = per_axis_assign[axis_idx]
+            if len(domain_assigns) == 0:
+                flat_assign.append((0, 0))
+            elif len(domain_assigns) == 1:
+                flat_assign.append(domain_assigns[0])
+            else:
+                # Multiple domains contribute to this axis.
+                # They should form a contiguous range in the virtual mesh.
+                all_start_dims = [a[0] for a in domain_assigns]
+                min_dim = min(all_start_dims)
+                max_dim_end = max(a[0] + a[1] for a in domain_assigns)
+                flat_assign.append((min_dim, max_dim_end - min_dim))
+
+        # Run parallelize + shift flow (same as standard path)
+        program = copy.deepcopy(program_shape)
+        seed_program = copy.deepcopy(program)
+
+        loops = program.visit(collect_loops)
+        axes_list_inner = program.visit(collect_parallelizeable_axes)
+
+        all_axes_inner = program.visit(collect_axis)
+        axes_names = set(axis.name for axis in all_axes_inner)
+        ringable_axes = set()
+
+        # collect the axes to be parallelized
+        parallelize_axes = []
+        cnt = 0
+        for loop, axes in zip(loops, axes_list_inner):
+            for axis in axes:
+                if flat_assign[cnt][1] != 0:
+                    parallelize_axes.append(axis.name)
+                cnt += 1
+
+        cnt = 0
+        succ = True
+        for loop, axes in zip(loops, axes_list_inner):
+            for axis in axes:
+                usd_axes = set(parallelize_axes)
+                succ &= parallelize(
+                    program,
+                    loop,
+                    axis,
+                    mesh,
+                    flat_assign[cnt][0],
+                    flat_assign[cnt][0] + flat_assign[cnt][1],
+                    usd_axes,
+                )
+                if not succ:
+                    break
+                if flat_assign[cnt][1] != 0:
+                    ringable_axes |= axes_names - usd_axes
+                shift(
+                    program,
+                    axis,
+                    mesh,
+                    flat_assign[cnt][0],
+                    flat_assign[cnt][0] + flat_assign[cnt][1],
+                    1,
+                    usd_axes,
+                )
+                cnt += 1
+            if not succ:
+                break
+
+        if succ:
+            for variant in _enumerate_collective_strategy_variants(program):
+                if _set_metadata_and_match(
+                    variant, mesh, virtual_mesh_shape
+                ) and _should_yield(variant):
+                    yield variant
+
+            # enumerate all subsets of ringable axes
+            for i in range(1, len(ringable_axes) + 1):
+                for ringable_axes_subset in itertools.combinations(
+                    ringable_axes, i
+                ):
+                    program = copy.deepcopy(seed_program)
+                    loops = program.visit(collect_loops)
+                    axes_list_inner = program.visit(collect_parallelizeable_axes)
+                    cnt = 0
+                    for loop, axes in zip(loops, axes_list_inner):
+                        for axis in axes:
+                            usd_axes = set(ringable_axes_subset)
+                            usd_axes.update(parallelize_axes)
+                            succ = parallelize(
+                                program,
+                                loop,
+                                axis,
+                                mesh,
+                                flat_assign[cnt][0],
+                                flat_assign[cnt][0] + flat_assign[cnt][1],
+                                usd_axes,
+                            )
+                            assert succ is True, (
+                                "should be able to parallelize as we have "
+                                "checked before"
+                            )
+                            shift(
+                                program,
+                                axis,
+                                mesh,
+                                flat_assign[cnt][0],
+                                flat_assign[cnt][0] + flat_assign[cnt][1],
+                                1,
+                                usd_axes,
+                            )
+                            cnt += 1
+                    for variant in _enumerate_collective_strategy_variants(
+                        program
+                    ):
+                        if _set_metadata_and_match(
+                            variant, mesh, virtual_mesh_shape
+                        ) and _should_yield(variant):
+                            yield variant
 
 
 def _collective_participants(mesh_shape: Tuple[int, ...], shard_dims: List[int]) -> int:
@@ -532,6 +830,17 @@ def search(
             )
         else:
             program.topology_metadata = _infer_topology_metadata(origin_mesh, mesh)
+
+        # Attach logical shard factors when a topology-aware policy is active.
+        if mesh_shape_policy is not None:
+            from mercury.search.topology_policy import (
+                compute_program_logical_shard_factors,
+            )
+
+            program._logical_shard_factors = compute_program_logical_shard_factors(
+                program
+            )
+
         matches_constraints = program_satisfies_tensor_mapping_constraints(
             program,
             tensor_mapping_constraints,
@@ -562,6 +871,20 @@ def search(
 
         axes = splited_program.visit(collect_axis)
         axis_num = len(axes)
+
+        # ---------------------------------------------------------------
+        # Flat search path: enumerate logical factors per domain
+        # ---------------------------------------------------------------
+        if isinstance(mesh_shape_policy, FlatMeshShapePolicy):
+            yield from _search_flat_path(
+                splited_program,
+                origin_mesh,
+                axes,
+                mesh_shape_policy,
+                _set_metadata_and_match,
+                _should_yield,
+            )
+            continue
 
         if mesh_shape_policy is not None:
             mesh_shapes_iter = iter(mesh_shape_policy.enumerate_shapes())

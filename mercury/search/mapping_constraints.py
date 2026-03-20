@@ -512,7 +512,17 @@ def program_satisfies_tensor_mapping_constraints(
     program: Program,
     constraints: Optional[TensorMappingConstraints],
 ) -> bool:
-    """Return whether a program satisfies GEMM tensor mapping constraints."""
+    """Return whether a program satisfies GEMM tensor mapping constraints.
+
+    For fixed-mode matrices, each tensor dimension's shard spec is checked
+    against the constraint's topology tokens and optional shard_factor.
+
+    When ``shard_factor`` is specified, the constraint matches if the actual
+    mesh dims are a subset of the resolved topology dims **and** the product
+    of the corresponding mesh extents equals the requested factor.  This
+    allows the search to produce candidates where only *part* of the
+    available topology is used for a given dimension.
+    """
     if constraints is None:
         return True
 
@@ -613,5 +623,95 @@ def program_satisfies_exact_layout_constraints(
         actual_signature = exact_layout_signature_from_buffer(buffer)
         if not exact_layout_signature_equal(actual_signature, expected_signature):
             return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Logical shard factor helpers
+# ---------------------------------------------------------------------------
+
+
+def logical_shard_factor_for_dim(
+    buffer_spec: Tuple[str, Tuple[int, ...]],
+    mesh_shape: Tuple[int, ...],
+    topology_dims: Tuple[int, ...],
+) -> int:
+    """Compute the effective logical shard factor for one buffer dimension.
+
+    This function provides an explicit API for computing the shard factor
+    that a single buffer dimension contributes within a specific physical
+    domain.  It mirrors the logic already used implicitly by
+    ``program_satisfies_tensor_mapping_constraints()`` when checking
+    ``shard_factor`` constraints.
+
+    Args:
+        buffer_spec: Normalised shard spec for one tensor dimension,
+            e.g. ``("R", ())`` or ``("S", (0, 1))``.
+        mesh_shape: The mesh shape the buffer lives on.
+        topology_dims: The mesh dim indices belonging to the target
+            physical domain (e.g. the ``inter_node_dims``).
+
+    Returns:
+        The product of mesh extents along the intersection of the
+        buffer's shard dims and the topology dims.  Returns 1 when the
+        dimension is replicated or not sharded on the target domain.
+    """
+    shard_type, mesh_dims = buffer_spec
+    if shard_type == "R" or len(mesh_dims) == 0:
+        return 1
+
+    topology_set = set(int(d) for d in topology_dims)
+    factor = 1
+    for md in mesh_dims:
+        md_int = int(md)
+        if md_int in topology_set:
+            factor *= int(mesh_shape[md_int])
+    return factor
+
+
+def program_satisfies_logical_factor_constraints(
+    program: Program,
+    required_factors: Dict[str, Dict[str, Tuple[int, ...]]],
+) -> bool:
+    """Check whether a program's logical shard factors match requirements.
+
+    This is a future-facing constraint checker that matches on
+    ``LogicalShardFactors`` directly rather than on raw mesh dim indices.
+
+    Args:
+        program: A distributed ``Program`` with ``mesh`` and
+            ``topology_metadata`` set.
+        required_factors: Constraints keyed by uppercase matrix name,
+            then by domain label, mapping to the expected factor tuple.
+            Example::
+
+                {
+                    "A": {"inter_node": (2, 8)},
+                    "B": {"inter_node": (4, 4)},
+                }
+
+    Returns:
+        ``True`` if every specified matrix/domain pair matches exactly.
+    """
+    from mercury.search.topology_policy import compute_program_logical_shard_factors
+
+    if program.mesh is None:
+        return False
+
+    actual = compute_program_logical_shard_factors(program)
+
+    for matrix_name, domain_constraints in required_factors.items():
+        matrix_factors = actual.get(matrix_name)
+        if matrix_factors is None:
+            return False
+        for domain_label, expected_tuple in domain_constraints.items():
+            actual_tuple = matrix_factors.domain_factors.get(domain_label)
+            if actual_tuple is None:
+                if expected_tuple == ():
+                    continue
+                return False
+            if actual_tuple != expected_tuple:
+                return False
 
     return True
