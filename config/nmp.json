@@ -2,11 +2,11 @@
   "name": "nmp",
   "compute": {
     "peak_tflops": {
-      "fp8": 4.0
+      "fp8": 16.0
     }
   },
   "memory": {
-    "bandwidth_tb_per_s": 0.064,
+    "bandwidth_tb_per_s": 0.256,
     "capacity_gb": 1
   },
   "interconnect": {
@@ -15,7 +15,7 @@
       "latency_us": 0.02
     },
     "inter_node": {
-      "bandwidth_gb_per_s": 4,
+      "bandwidth_gb_per_s": 16,
       "latency_us": 0.1
     }
   }

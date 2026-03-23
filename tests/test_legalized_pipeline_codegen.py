@@ -60,9 +60,14 @@ def _make_legalized_program(
     n_block: int = 16,
     mesh_shape: tuple = (2,),
 ):
-    """Build a minimal GEMM-like IR program and legalize it."""
-    I = Axis("I", m, 16)
-    J = Axis("J", n, n_block)
+    """Build a minimal GEMM-like IR program and legalize it.
+
+    The overlap axis (J) must survive ``eliminate_loops()`` as a real runtime
+    loop.  To achieve this, ``max_block_size`` is set to ``n_block`` so that
+    the loop is not collapsed.
+    """
+    I = Axis("I", m, 16, max_block_size=16)
+    J = Axis("J", n, n_block, max_block_size=n_block)
     K = Axis("K", k, k)
 
     mesh = DeviceMesh(

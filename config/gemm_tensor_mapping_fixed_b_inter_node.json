@@ -11,14 +11,9 @@
           "shard": [
             "inter_node"
           ],
-          "shard_factor": 4
+          "shard_factor": 16
         },
-        {
-          "shard": [
-            "inter_node"
-          ],
-          "shard_factor": 4
-        }
+        "R"
       ]
     },
     "C": {

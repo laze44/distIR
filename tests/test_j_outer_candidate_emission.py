@@ -194,7 +194,13 @@ class TestAsyncCandidateCodeVisibility:
         )
 
     def test_legalized_candidate_codegen_emits_pending_array(self):
-        """A legalized async candidate produces pending-tile tracking in codegen."""
+        """A legalized async candidate produces pending-tile tracking in codegen.
+
+        Note: ``eliminate_loops()`` is NOT called before codegen because it
+        would collapse the overlap axis (setting ``min_block_size = max_block_size``),
+        which would prevent the overlap loop from materializing.  True pipeline
+        codegen requires the overlap axis to survive as a real runtime loop.
+        """
         program = _build_gemm_program()
         mesh = DeviceMesh([0, 1], (2,))
         candidates = list(search(program, mesh, ["I", "J", "K"]))
@@ -214,7 +220,6 @@ class TestAsyncCandidateCodeVisibility:
         if len(regions) == 0:
             pytest.skip("No legalized regions produced for this candidate")
 
-        eliminate_loops(candidate)
         code = generate_pytorch_code(candidate)
 
         assert "_pending" in code, (
@@ -222,7 +227,11 @@ class TestAsyncCandidateCodeVisibility:
         )
 
     def test_prepared_pipeline_produces_pipeline_region_comment(self):
-        """Prepared pipeline produces a pipeline region comment in codegen."""
+        """Prepared pipeline produces a pipeline region comment in codegen.
+
+        Note: ``eliminate_loops()`` is NOT called before codegen because it
+        would collapse the overlap axis, preventing true pipeline lowering.
+        """
         program = _build_gemm_program()
         mesh = DeviceMesh([0, 1], (2,))
         candidates = list(search(program, mesh, ["I", "J", "K"]))
@@ -242,7 +251,6 @@ class TestAsyncCandidateCodeVisibility:
         if len(regions) == 0:
             pytest.skip("No legalized regions produced for this candidate")
 
-        eliminate_loops(candidate)
         code = generate_pytorch_code(candidate)
 
         assert "pipeline region" in code, (

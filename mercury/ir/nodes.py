@@ -109,6 +109,8 @@ class PendingTileDescriptor:
         output_buffer: The output buffer that the tile retires into.
         retire_indices: Index expressions needed to write the retired tile.
         reduce_buffer: The reduction buffer whose collective is in flight.
+        tile_id_expr: Stable runtime tile-id expression for retire-time
+            reconstruction (e.g. ``"J // 16"``).  Set by legalization.
     """
 
     slot_index: int = 0
@@ -116,6 +118,7 @@ class PendingTileDescriptor:
     output_buffer: Optional["Buffer"] = None
     retire_indices: Optional[List[Union[int, "Axis"]]] = None
     reduce_buffer: Optional["Buffer"] = None
+    tile_id_expr: Optional[str] = None
 
 
 @dataclass
@@ -139,6 +142,12 @@ class ManagedReductionPipelineRegion(IRNode):
         retire_target_buffer: The output buffer that retired tiles write into.
         retire_target_indices: Index expressions for retired tile writes.
         legalized: Whether the region passed legalization verification.
+        materialized_overlap_axis: Explicit axis that codegen emits as a
+            real runtime loop.  Set by legalization when it confirms the
+            overlap axis will survive into generated code.
+        pipeline_scope_axis: The name of the loop axis that owns the
+            pipeline scope (slot/work/pending allocation).  Codegen hoists
+            pipeline state to just outside this loop.
     """
 
     reduce_op: "ReduceOp" = None
@@ -155,6 +164,8 @@ class ManagedReductionPipelineRegion(IRNode):
     retire_target_buffer: Optional[Buffer] = None
     retire_target_indices: Optional[List[Union[int, Axis]]] = None
     legalized: bool = False
+    materialized_overlap_axis: Optional[Axis] = None
+    pipeline_scope_axis: Optional[str] = None
 
     def visit(
         self, fn: Callable[["IRNode"], T], fn_epiloge: Optional[Callable] = None
@@ -171,11 +182,18 @@ class ManagedReductionPipelineRegion(IRNode):
             self.reduce_op.buffer.tensor if self.reduce_op is not None else None
         )
         has_epilogue = self.consumer_epilogue is not None
+        mat_axis = (
+            self.materialized_overlap_axis.name
+            if self.materialized_overlap_axis is not None
+            else None
+        )
         return (
             f"{prefix}ManagedReductionPipelineRegion("
             f"reduce_buf={reduce_buf}, overlap_axis={overlap_name}, "
             f"stages={self.stage_count}, tiles={self.tile_count}, "
-            f"has_epilogue={has_epilogue}, legalized={self.legalized})"
+            f"has_epilogue={has_epilogue}, legalized={self.legalized}, "
+            f"materialized_axis={mat_axis}, "
+            f"pipeline_scope={self.pipeline_scope_axis})"
         )
 
     def _deepcopy_impl(self, memo: Dict[int, Any]) -> "ManagedReductionPipelineRegion":
@@ -208,6 +226,12 @@ class ManagedReductionPipelineRegion(IRNode):
             if self.retire_target_indices is not None
             else None,
             legalized=self.legalized,
+            materialized_overlap_axis=copy.deepcopy(
+                self.materialized_overlap_axis, memo
+            )
+            if self.materialized_overlap_axis is not None
+            else None,
+            pipeline_scope_axis=self.pipeline_scope_axis,
         )
         memo[id(self)] = result
         return result

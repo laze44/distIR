@@ -435,7 +435,17 @@ def _estimate_async_collective_pipeline_overhead_ms(
         if participants <= 1:
             continue
 
-        tile_count = max(1, region.tile_count)
+        # Use materialized_overlap_axis tile count when available to ensure
+        # the estimator uses the same realizable loop as codegen.
+        mat_axis = getattr(region, "materialized_overlap_axis", None)
+        if mat_axis is not None and int(mat_axis.size) <= int(mat_axis.min_block_size):
+            continue
+        if mat_axis is not None and int(mat_axis.size) > int(mat_axis.min_block_size):
+            tile_count = max(
+                1, int(mat_axis.size) // int(mat_axis.min_block_size)
+            )
+        else:
+            tile_count = max(1, region.tile_count)
         if tile_count < 2:
             continue
         stage_count = max(2, region.stage_count)

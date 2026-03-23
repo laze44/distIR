@@ -71,13 +71,28 @@
 1. 将满足条件的 async managed reduction 转化为显式的 `ManagedReductionPipelineRegion` IR 节点
 2. 合法化条件包括：
    - overlap axis 至少有 2 个 tile
+   - **overlap axis 必须能在 codegen 中物化为真实的运行时循环**（`size > min_block_size`）；不满足此条件的 axis（例如被消除后变成单 tile 的 `J_inner`）不允许用作 async overlap axis
    - collective 参与者 > 1
    - reduction buffer 的消费者可被 retime（仅有一条直接消费路径）
    - 无额外同迭代消费者强制提前 wait
 3. 不满足条件的 async 候选被 fallback 为 `blocking_collective`
 4. 合法化后的 pipeline region 替换原 `GridLoop.body` 中的 `ReduceOp + BufferLoad + BufferStore` 子序列，确保同一逻辑 reduction 不会被 codegen 两次
 
+`prepare_pipeline()` 的幂等保护还会对**已经合法化过的 region 做重新校验**：如果后续 pass（例如 `eliminate_loops()`）原地修改了共享 `Axis`，导致 `materialized_overlap_axis` 不再满足 `size > min_block_size`，该 region 会被撤销合法化并回退为 `blocking_collective`，避免 codegen 读取过期 slot-rotation 元数据。
+
 不再保留"直接信任 `ReduceOp` metadata"的 backward-compatible async 路径。只有经过 legalization 的 async 候选才能获得 async lowering 和 async ranking。
+
+#### 真流水线（True Pipeline）语义
+
+合法化后的 pipeline region 携带显式的流水线作用域元数据：
+
+- `materialized_overlap_axis`：明确标识哪个 axis 会在生成代码中物化为 `for` 循环
+- `pipeline_scope_axis`：codegen 将 async state（slots, works, pending）提升到此 axis 循环的外层
+- slot 生命周期跨越整个 overlap loop，而非在每次 tile 迭代内重建
+- slot 选择通过 overlap loop 变量取模旋转（例如 `slot = (J // block) % stage_count`）
+- 只有在 slot 复用或 loop 结束时才 wait/retire
+
+如果一个 legalized region 到达 codegen 时没有真实的 slot 变量（overlap axis 的循环被消除），codegen 将 **raise error** 而非静默退化为单 slot 行为。正常路径下，这类 stale region 会在 `prepare_pipeline()` 重入时被提前降级，不应再进入 codegen 的 legalized 分支。
 
 ### 待退役 Tile 状态（Pending-Tile Retirement）
 
@@ -98,3 +113,4 @@
 - **drain**：overlap loop 退出时，对所有仍在途的 slot 执行 wait 并退役延迟消费者
 - 完成后的 tile 通过 consumer store 写入最终输出（delayed retirement）
 
+**codegen 约束**：async state（slots, works, pending）的生命周期跨越整个 overlap loop scope，在 loop 开始前分配，在 loop 结束后 drain。Slot 旋转使用 overlap loop 的实际循环变量。如果 overlap axis 在 codegen 中不产生真实循环，则 legalized region 会触发 codegen error。

@@ -181,6 +181,16 @@ def _overlap_axis_has_enough_tiles(overlap_axis: Axis, min_tiles: int = 2) -> bo
     return tile_count >= min_tiles
 
 
+def _overlap_axis_materializes_as_runtime_loop(overlap_axis: Axis) -> bool:
+    """Check whether *overlap_axis* will produce a real ``for`` loop in codegen.
+
+    Codegen emits a loop only when ``axis.size > axis.min_block_size``.
+    An axis where ``size == min_block_size`` becomes a single static slice
+    and cannot drive slot rotation.
+    """
+    return int(overlap_axis.size) > int(overlap_axis.min_block_size)
+
+
 def _has_multiple_participants(
     program: Program,
     reduce_op: ReduceOp,
@@ -232,6 +242,12 @@ def _build_pending_tiles(
         retire_indices = [
             idx for idx in consumer_store.indices if isinstance(idx, (int, Axis))
         ]
+    # Build a stable tile-id expression for codegen retire-time reconstruction
+    block_size = int(overlap_axis.min_block_size)
+    if block_size > 1:
+        tile_id_expr = f"{overlap_axis.name} // {block_size}"
+    else:
+        tile_id_expr = overlap_axis.name
     descriptors = []
     for slot in range(min(stage_count, tile_count)):
         descriptors.append(
@@ -241,6 +257,7 @@ def _build_pending_tiles(
                 reduce_buffer=reduce_buffer,
                 output_buffer=output_buffer,
                 retire_indices=retire_indices,
+                tile_id_expr=tile_id_expr,
             )
         )
     return descriptors
@@ -276,6 +293,10 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
 
         # Check 1: overlap axis has at least two tiles
         if not _overlap_axis_has_enough_tiles(overlap_axis):
+            continue
+
+        # Check 1b: overlap axis materializes as a real runtime loop in codegen
+        if not _overlap_axis_materializes_as_runtime_loop(overlap_axis):
             continue
 
         # Check 2: collective has more than one participant
@@ -319,6 +340,8 @@ def legalize_async_reductions(program: Program) -> List[ManagedReductionPipeline
                 if isinstance(idx, (int, Axis))
             ],
             legalized=True,
+            materialized_overlap_axis=overlap_axis,
+            pipeline_scope_axis=overlap_axis.name,
         )
         regions.append(region)
 
@@ -385,6 +408,125 @@ def _replace_legalized_nodes_in_loop(
     return False
 
 
+def _restore_invalidated_region_in_loop(
+    program: Program,
+    region: ManagedReductionPipelineRegion,
+) -> bool:
+    """Restore a stale pipeline region back to its original loop-body nodes."""
+    target_region_id = id(region)
+
+    grid_loops: List[GridLoop] = []
+
+    def _find_grids(node: IRNode):
+        if isinstance(node, GridLoop):
+            grid_loops.append(node)
+        return None
+
+    program.visit(_find_grids)
+
+    restored_children: List[IRNode] = []
+    if region.reduce_op is not None:
+        restored_children.append(region.reduce_op)
+    if region.consumer_load is not None:
+        restored_children.append(region.consumer_load)
+    if region.consumer_store is not None:
+        restored_children.append(region.consumer_store)
+
+    # Collect ids of consumer nodes that will be restored into the region's
+    # GridLoop.  These same nodes may also exist as stale references in OTHER
+    # GridLoop bodies (the outer loop kept them when _replace_legalized_nodes_
+    # in_loop only operated on the inner loop that contained the ReduceOp).
+    consumer_ids_to_dedupe: Set[int] = set()
+    if region.consumer_load is not None:
+        consumer_ids_to_dedupe.add(id(region.consumer_load))
+    if region.consumer_store is not None:
+        consumer_ids_to_dedupe.add(id(region.consumer_store))
+
+    restored_in_loop = None
+    for grid_loop in grid_loops:
+        new_body: List[IRNode] = []
+        restored = False
+        for child in grid_loop.body:
+            if id(child) == target_region_id:
+                new_body.extend(restored_children)
+                restored = True
+            else:
+                new_body.append(child)
+        if restored:
+            grid_loop.body = new_body
+            restored_in_loop = grid_loop
+            break
+
+    if restored_in_loop is None:
+        return False
+
+    # Remove stale consumer references from OTHER GridLoop bodies to prevent
+    # duplicate code emission when codegen visits both the inner and outer loop.
+    if consumer_ids_to_dedupe:
+        for grid_loop in grid_loops:
+            if grid_loop is restored_in_loop:
+                continue
+            grid_loop.body = [
+                child for child in grid_loop.body
+                if id(child) not in consumer_ids_to_dedupe
+            ]
+
+    return True
+
+
+def _downgrade_async_reduce_op(reduce_op: Optional[ReduceOp]) -> bool:
+    """Rewrite one async-overlap reduce op to blocking mode."""
+    if reduce_op is None:
+        return False
+    if reduce_op.managed_collective_strategy != "async_collective_overlap":
+        return False
+
+    reduce_op.managed_collective_strategy = "blocking_collective"
+    reduce_op.async_collective_overlap_axis = None
+    reduce_op.async_collective_tile_count = 1
+    reduce_op.async_collective_stage_count = 1
+    reduce_op.async_collective_lifecycle = None
+    return True
+
+
+def _revalidate_existing_regions(
+    program: Program,
+    existing_legalized: List[ManagedReductionPipelineRegion],
+) -> List[ManagedReductionPipelineRegion]:
+    """Re-check previously legalized regions after IR mutation.
+
+    ``eliminate_loops()`` mutates shared ``Axis`` objects in place, so a region
+    that was valid during an earlier legalization pass may later lose the
+    runtime loop needed for slot rotation.  Revalidate those regions before
+    reusing them via the idempotency guard in ``prepare_pipeline()``.
+    """
+    still_valid: List[ManagedReductionPipelineRegion] = []
+    invalidated = False
+
+    for region in existing_legalized:
+        check_axis = (
+            region.materialized_overlap_axis
+            if region.materialized_overlap_axis is not None
+            else region.overlap_axis
+        )
+        if (
+            check_axis is not None
+            and _overlap_axis_materializes_as_runtime_loop(check_axis)
+        ):
+            still_valid.append(region)
+            continue
+
+        region.legalized = False
+        _downgrade_async_reduce_op(region.reduce_op)
+        _restore_invalidated_region_in_loop(program, region)
+        invalidated = True
+
+    if invalidated:
+        fallback_failed_async_candidates(program, still_valid)
+
+    return still_valid
+
+
 def prepare_pipeline(program: Program) -> List[ManagedReductionPipelineRegion]:
     """Shared pipeline-preparation step for estimation and code generation.
 
@@ -411,7 +553,7 @@ def prepare_pipeline(program: Program) -> List[ManagedReductionPipelineRegion]:
     existing = program.visit(collect_pipeline_regions)
     existing_legalized = [r for r in existing if r.legalized]
     if existing_legalized:
-        return existing_legalized
+        return _revalidate_existing_regions(program, existing_legalized)
 
     regions = legalize_async_reductions(program)
 
@@ -454,16 +596,9 @@ def fallback_failed_async_candidates(
     downgraded = 0
 
     for reduce_op in reduce_ops:
-        if reduce_op.managed_collective_strategy != "async_collective_overlap":
-            continue
         if id(reduce_op) in legalized_reduce_ids:
             continue
-
-        reduce_op.managed_collective_strategy = "blocking_collective"
-        reduce_op.async_collective_overlap_axis = None
-        reduce_op.async_collective_tile_count = 1
-        reduce_op.async_collective_stage_count = 1
-        reduce_op.async_collective_lifecycle = None
-        downgraded += 1
+        if _downgrade_async_reduce_op(reduce_op):
+            downgraded += 1
 
     return downgraded

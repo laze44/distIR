@@ -416,6 +416,16 @@ def search_gemm(
     for tensor_name, summary in tensor_mapping_constraints.summary_by_matrix().items():
         summary_lines.append(f"  {tensor_name}: {summary}")
 
+    tensor_mapping_lines = [
+        (
+            f"GEMM Tensor Mapping: M={m}, N={n}, K={k}, "
+            f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
+        ),
+        f"Hardware config: {hw_config['name']}",
+        f"Tensor mapping config: {mapping_config_path}",
+        "",
+    ]
+
     for idx, (res_program, estimate) in enumerate(selected_programs):
         code = generate_pytorch_code(res_program)
         ir_text = _capture_dump(res_program)
@@ -457,12 +467,18 @@ def search_gemm(
         )
         summary_lines.append(f"  Estimated total time: {estimate.total_time_ms:.6f} ms")
         if len(tensor_device_mapping) > 0:
-            summary_lines.append("  Tensor Mapping (A/B/C on each device):")
+            summary_lines.append(
+                "  Tensor Mapping: see tensor_mapping.txt"
+            )
+            tensor_mapping_lines.append(f"Program {idx + 1} (Rank {idx + 1}):")
+            tensor_mapping_lines.append(
+                "  Tensor Mapping (A/B/C on each device):"
+            )
             for tensor_name in ("A", "B", "C"):
                 tensor_info = tensor_device_mapping.get(tensor_name)
                 if tensor_info is None:
                     continue
-                summary_lines.append(f"    {tensor_name}:")
+                tensor_mapping_lines.append(f"    {tensor_name}:")
                 for device_id, device_info in tensor_info["per_device"].items():
                     dim_segments = []
                     for dim_info in device_info["dim_mappings"]:
@@ -476,7 +492,7 @@ def search_gemm(
                                 f" shard={dim_info['shard_index']}/{dim_info['num_shards']})"
                             )
                         dim_segments.append(seg)
-                    summary_lines.append(
+                    tensor_mapping_lines.append(
                         f"      device {device_id}, mesh_coord={device_info['mesh_coord']}: "
                         + "; ".join(dim_segments)
                     )
@@ -501,10 +517,15 @@ def search_gemm(
             f"  Logical Factors: {' '.join(logical_factor_parts)}"
         )
         summary_lines.append("")
+        tensor_mapping_lines.append("")
 
     summary_path = os.path.join(result_dir, "summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
+
+    tensor_mapping_path = os.path.join(result_dir, "tensor_mapping.txt")
+    with open(tensor_mapping_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(tensor_mapping_lines))
 
     print(
         f"Found {len(searched_programs)} program(s) for GEMM {m}x{n}x{k} "
@@ -514,6 +535,7 @@ def search_gemm(
     print(f"Saved top-{top_k} program(s) per mapping combination ({len(groups)} combinations, {save_count} total)")
     print(f"Results saved to: {result_dir}/")
     print(f"Summary: {summary_path}")
+    print(f"Tensor mapping: {tensor_mapping_path}")
 
 
 def main() -> None:

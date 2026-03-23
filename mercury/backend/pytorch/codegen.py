@@ -111,6 +111,7 @@ class PyTorchCodegen:
         self.async_collective_buffers = {}
         self.async_slot_vars = {}
         self.pipeline_regions = {}
+        self._pipeline_state_emitted = set()  # track buffers whose state is already emitted
 
         for region in program.visit(collect_pipeline_regions):
             if region.legalized and region.reduce_op is not None:
@@ -124,9 +125,12 @@ class PyTorchCodegen:
                 overlap_axis = region.overlap_axis
                 if overlap_axis is None:
                     continue
+                # Use pipeline_scope_axis from region, falling back to overlap_axis name
+                scope_axis = region.pipeline_scope_axis or overlap_axis.name
                 stage_count = max(2, region.stage_count)
                 self.async_collective_buffers[buffer_name] = {
                     "overlap_axis_name": overlap_axis.name,
+                    "pipeline_scope_axis": scope_axis,
                     "stage_count": stage_count,
                     "collective_shard_dims": collective_shard_dims,
                     "slots_name": f"{buffer_name}_async_slots",
@@ -329,8 +333,11 @@ class PyTorchCodegen:
         4. Mark slot pending
 
         The drain loop (wait remaining slots after the overlap loop ends)
-        is handled by ``visit_GridLoop`` using the config from
-        ``_initialize_collective_state``.
+        is handled by ``visit_GridLoop`` via ``emit_pipeline_scope_drain``.
+
+        For legalized regions, the slot variable MUST come from a real loop
+        variable.  If no slot variable was set (the overlap axis did not
+        produce a runtime loop), this is a codegen error.
         """
         if node.reduce_op is None:
             return
@@ -350,7 +357,16 @@ class PyTorchCodegen:
                 self.visit(node.consumer_store)
             return
 
-        slot_var = self.async_slot_vars.get(buffer_name, "0")
+        slot_var = self.async_slot_vars.get(buffer_name)
+        if slot_var is None:
+            # Legalized region reached codegen without a real slot variable.
+            # This means the overlap axis did not materialize as a runtime loop.
+            raise ValueError(
+                f"Legalized pipeline region for '{buffer_name}' has no slot "
+                f"variable.  The overlap axis '{overlap_name}' did not "
+                f"produce a runtime loop for slot rotation.  This is a bug "
+                f"in legalization — the candidate should have been rejected."
+            )
 
         self._emit_async_pipeline_wait_on_reuse(node, config, slot_var)
         self._emit_async_pipeline_reduce(node, config, slot_var)
@@ -510,8 +526,109 @@ class PyTorchCodegen:
         if last_axis_cond is not None:
             self.indent_level -= 1
 
+    def emit_pipeline_scope_init(self, buffer_name: str, config: dict) -> None:
+        """Emit pipeline state allocation at the correct scope (outside overlap loop).
+
+        Allocates slots, works, and pending arrays once per pipeline scope,
+        rather than inside the loop body via visit_BufferMatch.
+        """
+        if buffer_name in self._pipeline_state_emitted:
+            return
+        self._pipeline_state_emitted.add(buffer_name)
+
+        stage_count = config["stage_count"]
+        slots_name = config["slots_name"]
+        works_name = config["works_name"]
+        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+        region = self.pipeline_regions.get(buffer_name)
+
+        # Emit slot buffer allocation if the region uses slots
+        if config.get("use_slots", False):
+            self.emit(
+                f"# --- pipeline scope init: {buffer_name} "
+                f"(stages={stage_count}) ---"
+            )
+            # Slot buffer shape comes from the reduce buffer
+            if region is not None and region.reduce_op is not None:
+                shape = tuple(region.reduce_op.buffer.get_shape())
+                dtype = region.reduce_op.buffer.dtype
+                self.emit(
+                    f"{slots_name} = [torch.empty({shape}, dtype={dtype}, device=device) "
+                    f"for _ in range({stage_count})]"
+                )
+        self.emit(f"{works_name} = [None for _ in range({stage_count})]")
+        self.emit(f"{pending_name} = [None for _ in range({stage_count})]")
+
+    def emit_pipeline_scope_drain(self, buffer_name: str, config: dict) -> None:
+        """Emit drain loop: wait all remaining slots after the overlap loop exits."""
+        works_name = config["works_name"]
+        stage_count = config["stage_count"]
+        is_legalized = config.get("legalized", False)
+        pending_name = config.get("pending_name", f"{buffer_name}_pending")
+        region = self.pipeline_regions.get(buffer_name) if is_legalized else None
+
+        lifecycle = None
+        if region is not None:
+            lifecycle = region.lifecycle
+
+        self.emit(f"for _slot in range({stage_count}):")
+        self.indent_level += 1
+        self.emit(f"if {works_name}[_slot] is not None:")
+        self.indent_level += 1
+        if lifecycle is not None:
+            self.emit(f"# {lifecycle.drain_wait_op}")
+        self.emit(f"{works_name}[_slot].wait()")
+        self.emit(f"{works_name}[_slot] = None")
+        if is_legalized:
+            if (
+                region is not None
+                and region.consumer_store is not None
+                and region.retire_target_buffer is not None
+            ):
+                slots_name = config["slots_name"]
+                output_tensor = region.retire_target_buffer.tensor
+                output_expr = self._buffer_expr(output_tensor)
+                retired_slot_expr = f"{slots_name}[_slot]"
+
+                if region.consumer_epilogue is not None:
+                    import ast as _ast
+
+                    epilogue_src = _ast.unparse(
+                        region.consumer_epilogue.node
+                    )
+                    source_name = None
+                    if region.consumer_load is not None:
+                        target = region.consumer_load.target
+                        if isinstance(target, str):
+                            source_name = target
+                    if source_name is not None:
+                        retired_value = epilogue_src.replace(
+                            source_name, retired_slot_expr
+                        )
+                    else:
+                        retired_value = retired_slot_expr
+                else:
+                    retired_value = retired_slot_expr
+
+                self.emit(f"if {pending_name}[_slot] is not None:")
+                self.indent_level += 1
+                pending_idx = f"{pending_name}[_slot]"
+                self.emit(f"{output_expr}[{pending_idx}] = {retired_value}")
+                self.emit(f"{pending_name}[_slot] = None")
+                self.indent_level -= 1
+            else:
+                self.emit(f"{pending_name}[_slot] = None")
+        self.indent_level -= 1
+        self.indent_level -= 1
+
     def visit_BufferMatch(self, node: BufferMatch) -> None:
-        """Process buffer matching."""
+        """Process buffer matching.
+
+        For legalized pipeline regions, slot/work/pending state allocation is
+        deferred to ``emit_pipeline_scope_init`` (called from ``visit_GridLoop``
+        at the correct scope).  Here we only mark ``use_slots`` so that
+        ``_buffer_expr`` returns the slot-indexed form.
+        """
 
         if isinstance(node.tensor_name, str) and isinstance(node.buffer.tensor, str):
             # Generate shape assertion
@@ -520,13 +637,22 @@ class PyTorchCodegen:
                 f"assert {node.buffer.tensor}.shape == {shape_str}, 'Shape mismatch for {node.buffer.tensor}'"
             )
             async_config = self.async_collective_buffers.get(node.buffer.tensor)
-            if async_config is not None:
+            if async_config is not None and not async_config.get("legalized", False):
+                # Non-legalized async: emit works here (legacy path)
                 works_name = async_config["works_name"]
                 stage_count = async_config["stage_count"]
                 self.emit(f"{works_name} = [None for _ in range({stage_count})]")
+            # For legalized configs, state is hoisted by emit_pipeline_scope_init
         elif node.tensor_name is None and isinstance(node.buffer.tensor, str):
             async_config = self.async_collective_buffers.get(node.buffer.tensor)
             if async_config is not None:
+                if async_config.get("legalized", False):
+                    # Legalized pipeline: only mark use_slots here.
+                    # Actual allocation is deferred to emit_pipeline_scope_init
+                    # which is called from visit_GridLoop at the pipeline scope.
+                    async_config["use_slots"] = True
+                    return
+                # Non-legalized: allocate here (legacy path)
                 shape = tuple(node.buffer.get_shape())
                 slots_name = async_config["slots_name"]
                 works_name = async_config["works_name"]
@@ -537,11 +663,6 @@ class PyTorchCodegen:
                     f"for _ in range({stage_count})]"
                 )
                 self.emit(f"{works_name} = [None for _ in range({stage_count})]")
-                if async_config.get("legalized", False):
-                    pending_name = async_config.get(
-                        "pending_name", f"{node.buffer.tensor}_pending"
-                    )
-                    self.emit(f"{pending_name} = [None for _ in range({stage_count})]")
                 return
             # Generate temporary buffer
             if len(self.active_ring_axes) > 0:
@@ -618,13 +739,32 @@ class PyTorchCodegen:
         self.indent_level -= 1
 
     def visit_GridLoop(self, node: GridLoop) -> None:
-        """Generate code for a GridLoop node."""
+        """Generate code for a GridLoop node.
+
+        For legalized pipeline regions, the async state (slots, works, pending)
+        is hoisted to just outside the overlap loop, and slot rotation uses the
+        actual loop variable.  The drain loop is emitted after the overlap loop.
+        """
         indent_add = []
         old_active_ring_axes = self.active_ring_axes
         self.active_ring_axes = copy.deepcopy(self.active_ring_axes)
         old_async_slot_vars = copy.deepcopy(self.async_slot_vars)
 
         ring_axes = []
+        # Track which axes map to pipeline-scope configs for hoisted init
+        pipeline_init_for_axis = {}  # axis.name -> [(buffer_name, config)]
+
+        # Pre-scan: identify which axes own pipeline scope for legalized regions
+        for buffer_name, config in self.async_collective_buffers.items():
+            if not config.get("legalized", False):
+                continue
+            scope_axis = config.get("pipeline_scope_axis", config["overlap_axis_name"])
+            for axis in node.axes:
+                if axis.name == scope_axis:
+                    if axis.name not in pipeline_init_for_axis:
+                        pipeline_init_for_axis[axis.name] = []
+                    pipeline_init_for_axis[axis.name].append((buffer_name, config))
+
         # Generate nested loops
         for axis in node.axes:
             var = axis.name
@@ -637,8 +777,10 @@ class PyTorchCodegen:
                 indent_add.append(0)
                 continue
 
-            # for comm_name in axis.ring_comm:
-            #     self.emit(f"{self.ring_comm_prefix}{axis.name}{comm_name} = RingComm({self.process_group_name})")
+            # Emit pipeline scope init BEFORE the loop for legalized regions
+            if axis.name in pipeline_init_for_axis:
+                for buffer_name, config in pipeline_init_for_axis[axis.name]:
+                    self.emit_pipeline_scope_init(buffer_name, config)
 
             if len(axis.ring_comm) == 0:
                 self.emit(f"for {var} in range({begin}, {end}, {stride}):")
@@ -650,10 +792,6 @@ class PyTorchCodegen:
                 # if there is a ring comm, we need to split the loop into two:
                 # 1. the first loop is the loop over local data
                 # 2. the second loop is the loop over ringed data
-                # example:
-                # for i in range(0, size//num_cards, min_block_size):
-                #     for j in range(0, num_cards, 1):
-
                 axis_var = []
                 if begin + stride < end // axis.ring_comm_cards:
                     self.emit(
@@ -706,79 +844,11 @@ class PyTorchCodegen:
                 if axis.name in self.active_axis:
                     self.active_axis.remove(axis)
                     self.axis_vars[axis.name] = []
+                # Emit drain for pipeline regions whose overlap axis matches
                 for buffer_name, config in self.async_collective_buffers.items():
                     if config["overlap_axis_name"] != axis.name:
                         continue
-                    works_name = config["works_name"]
-                    is_legalized = config.get("legalized", False)
-                    self.emit(f"for _slot in range({config['stage_count']}):")
-                    self.indent_level += 1
-                    self.emit(f"if {works_name}[_slot] is not None:")
-                    self.indent_level += 1
-                    lifecycle = None
-                    region = (
-                        self.pipeline_regions.get(buffer_name) if is_legalized else None
-                    )
-                    if region is not None:
-                        lifecycle = region.lifecycle
-                    if lifecycle is not None:
-                        self.emit(f"# {lifecycle.drain_wait_op}")
-                    self.emit(f"{works_name}[_slot].wait()")
-                    self.emit(f"{works_name}[_slot] = None")
-                    if is_legalized:
-                        pending_name = config.get(
-                            "pending_name", f"{buffer_name}_pending"
-                        )
-                        if (
-                            region is not None
-                            and region.consumer_store is not None
-                            and region.retire_target_buffer is not None
-                        ):
-                            slots_name = config["slots_name"]
-                            output_tensor = region.retire_target_buffer.tensor
-                            output_expr = self._buffer_expr(output_tensor)
-                            retired_slot_expr = f"{slots_name}[_slot]"
-
-                            if region.consumer_epilogue is not None:
-                                import ast as _ast
-
-                                epilogue_src = _ast.unparse(
-                                    region.consumer_epilogue.node
-                                )
-                                source_name = None
-                                if region.consumer_load is not None:
-                                    target = region.consumer_load.target
-                                    if isinstance(target, str):
-                                        source_name = target
-                                if source_name is not None:
-                                    retired_value = epilogue_src.replace(
-                                        source_name, retired_slot_expr
-                                    )
-                                else:
-                                    retired_value = retired_slot_expr
-                            else:
-                                retired_value = retired_slot_expr
-
-                            self.emit(f"if {pending_name}[_slot] is not None:")
-                            self.indent_level += 1
-                            pending_idx = f"{pending_name}[_slot]"
-                            self.emit(f"{output_expr}[{pending_idx}] = {retired_value}")
-                            self.emit(f"{pending_name}[_slot] = None")
-                            self.indent_level -= 1
-                        else:
-                            self.emit(f"{pending_name}[_slot] = None")
-                    self.indent_level -= 1
-                    self.indent_level -= 1
-            # this is a ad-hoc solution, now we create the collective when the buffer is loaded
-            # if axis.name in axis2reduce:
-            #     reduce_ops = axis2reduce[axis.name]
-            #     met_collective = False
-            #     for reduce_op in reduce_ops:
-            #         if reduce_op.shard_dim is not None and len(reduce_op.comm) == 0: # if sharded and not ringed
-            #             if met_collective:
-            #                 raise ValueError("Only one collective reduce is supported for now")
-            #             met_collective = True
-            #             self.emit(f"{reduce_op.collective_op}({reduce_op.buffer.tensor}, dist.all_reduce, group=get_device_group(indices, {self.mesh_shape}, {reduce_op.shard_dim}))")
+                    self.emit_pipeline_scope_drain(buffer_name, config)
 
         self.active_ring_axes = old_active_ring_axes
         self.async_slot_vars = old_async_slot_vars

@@ -581,6 +581,25 @@ def _layout_allows_async_overlap(
     )
 
 
+def _overlap_axis_is_realizable(axis: Axis) -> bool:
+    """Check whether *axis* can act as a true runtime tile loop after codegen.
+
+    An axis is realizable for async overlap when:
+    1. It has at least two tiles (``size / min_block_size >= 2``).
+    2. Its size is strictly larger than its min_block_size, meaning codegen
+       will emit a ``for ... in range(...)`` loop rather than a single
+       static-slice body.
+
+    This rejects collapsed inner axes (e.g. ``J_inner`` where
+    ``size == min_block_size``) that look legal in IR metadata but produce
+    no runtime loop for slot rotation.
+    """
+    if int(axis.size) <= int(axis.min_block_size):
+        return False
+    tile_count = int(axis.size) // int(axis.min_block_size)
+    return tile_count >= 2
+
+
 def _eligible_async_overlap_axes(
     program: Program, reduce_op, collective_shard_dims: List[int]
 ) -> List[Axis]:
@@ -598,12 +617,21 @@ def _eligible_async_overlap_axes(
         if index.name in seen:
             continue
         seen.add(index.name)
+        # Reject axes that cannot drive slot rotation in codegen
+        if not _overlap_axis_is_realizable(index):
+            continue
         tile_count = int(index.size) // int(index.min_block_size)
         if tile_count < 2:
             continue
         if not _layout_allows_async_overlap(reduce_op, index, collective_shard_dims):
             continue
         eligible_axes.append(index)
+
+    # Prefer outer tiled axes (larger size) over inner fully-materialized
+    # axes to maximize slot rotation opportunity.
+    if len(eligible_axes) > 1:
+        eligible_axes.sort(key=lambda ax: int(ax.size), reverse=True)
+
     return eligible_axes
 
 

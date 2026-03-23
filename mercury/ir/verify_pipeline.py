@@ -94,6 +94,48 @@ def _verify_region(region: ManagedReductionPipelineRegion) -> List[str]:
             f"Region for '{buf_name}' has no collective shard dimensions"
         )
 
+    # 11. Overlap axis must materialize as a multi-tile runtime loop
+    if region.overlap_axis is not None:
+        axis = region.overlap_axis
+        if int(axis.size) <= int(axis.min_block_size):
+            errors.append(
+                f"Region for '{buf_name}' overlap axis '{axis.name}' has "
+                f"size={axis.size} <= min_block_size={axis.min_block_size}; "
+                f"it will not produce a runtime loop for slot rotation"
+            )
+
+    # 12. Pipeline scope axis should be set for legalized regions
+    if region.pipeline_scope_axis is None:
+        errors.append(
+            f"Region for '{buf_name}' has no pipeline_scope_axis; "
+            f"codegen cannot hoist async state to the correct scope"
+        )
+
+    # 13. Materialized overlap axis should match overlap axis
+    if (
+        region.materialized_overlap_axis is not None
+        and region.overlap_axis is not None
+    ):
+        mat = region.materialized_overlap_axis
+        if int(mat.size) <= int(mat.min_block_size):
+            errors.append(
+                f"Region for '{buf_name}' materialized_overlap_axis "
+                f"'{mat.name}' would not produce a runtime loop "
+                f"(size={mat.size}, block={mat.min_block_size})"
+            )
+
+    # 14. Tile count and stage count must allow slot reuse
+    if region.tile_count >= 2 and region.stage_count >= 2:
+        if region.tile_count < region.stage_count:
+            # Not an error but worth noting: no slot reuse will occur.
+            # We allow it since drain still operates correctly.
+            pass
+    elif region.tile_count < 2:
+        errors.append(
+            f"Region for '{buf_name}' has tile_count={region.tile_count}; "
+            f"cannot produce slot reuse for true pipeline"
+        )
+
     return errors
 
 
