@@ -24,8 +24,8 @@ from mercury.search.mapping_constraints import load_tensor_mapping_constraints
 from mercury.search.search import search_with_progress
 from mercury.search.topology_policy import (
     compute_program_logical_shard_factors,
-    make_gemm_flat_mesh_shape_policy,
-    make_gemm_mesh_shape_policy,
+    make_flat_mesh_shape_policy,
+    make_mesh_shape_policy,
 )
 
 
@@ -223,15 +223,12 @@ def _extract_abc_device_mapping(program) -> Dict[str, Any]:
 
 def _validate_mapping_constraints_topology(
     constraints,
-    inter_node: int,
-    intra_node: int,
+    num_devices: int,
     mapping_config_path: str,
 ) -> None:
     """Fail fast when fixed shard topology tokens cannot exist on the topology."""
     topology_capacity = {
-        "inter_node": int(inter_node) > 1,
-        "intra_node": int(intra_node) > 1,
-        "mixed": int(inter_node) > 1 and int(intra_node) > 1,
+        "device": int(num_devices) > 1,
     }
 
     incompatibilities: List[str] = []
@@ -247,7 +244,7 @@ def _validate_mapping_constraints_topology(
             unavailable_tokens = [
                 token
                 for token in dim_mapping.shard_topology
-                if not topology_capacity[token]
+                if not topology_capacity.get(token, False)
             ]
             if len(unavailable_tokens) == 0:
                 continue
@@ -255,7 +252,7 @@ def _validate_mapping_constraints_topology(
             missing = ", ".join(unavailable_tokens)
             incompatibilities.append(
                 f"{matrix_name}[dim {dim_id}] requires {dim_mapping.to_summary()} "
-                f"but topology inter_node={inter_node}, intra_node={intra_node} "
+                f"but topology num_devices={num_devices} "
                 f"has no shardable {missing} dimension"
             )
 
@@ -266,7 +263,7 @@ def _validate_mapping_constraints_topology(
     raise ValueError(
         f"Tensor mapping config '{mapping_config_path}' is incompatible with the "
         f"requested topology: {detail_text}. Use '--mapping-config "
-        "config/gemm_tensor_mapping.json' for flexible layouts, or choose a "
+        "config/gemm_tensor_mapping_flexible.json' for flexible layouts, or choose a "
         "topology with positive cardinality for the required shard dimensions."
     )
 
@@ -275,8 +272,7 @@ def search_gemm(
     m: int,
     n: int,
     k: int,
-    inter_node: int,
-    intra_node: int,
+    num_devices: int,
     output_dir: str,
     top_k: int,
     hw_config_path: str,
@@ -290,8 +286,7 @@ def search_gemm(
         m: M dimension of the matrix multiplication.
         n: N dimension of the matrix multiplication.
         k: K dimension of the matrix multiplication.
-        inter_node: Number of inter-node partitions in the mesh.
-        intra_node: Number of intra-node partitions in the mesh.
+        num_devices: Number of devices in the single-domain clique topology.
         output_dir: Directory to write result files into.
         top_k: Number of best estimated programs to persist.
         hw_config_path: Path to hardware configuration JSON file.
@@ -300,12 +295,12 @@ def search_gemm(
             independent logical factor enumeration per axis.  When False,
             use the legacy rank-limited factorisation policy.
     """
-    if inter_node <= 0 or intra_node <= 0:
-        raise ValueError("inter_node and intra_node must be positive integers")
+    if num_devices <= 0:
+        raise ValueError("num_devices must be a positive integer")
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
 
-    world_size = inter_node * intra_node
+    world_size = num_devices
 
     source = _format_gemm_source(m, n, k)
 
@@ -320,19 +315,18 @@ def search_gemm(
         raise ValueError("Could not find function definition in GEMM template")
 
     devices = list(range(world_size))
-    mesh = DeviceMesh(devices, (inter_node, intra_node))
+    mesh = DeviceMesh(devices, (world_size,))
     tensor_mapping_constraints = load_tensor_mapping_constraints(mapping_config_path)
     _validate_mapping_constraints_topology(
         tensor_mapping_constraints,
-        inter_node,
-        intra_node,
+        num_devices,
         mapping_config_path,
     )
 
     if flat_topology:
-        mesh_shape_policy = make_gemm_flat_mesh_shape_policy(inter_node, intra_node)
+        mesh_shape_policy = make_flat_mesh_shape_policy(num_devices)
     else:
-        mesh_shape_policy = make_gemm_mesh_shape_policy(inter_node, intra_node)
+        mesh_shape_policy = make_mesh_shape_policy(num_devices)
 
     searched_programs = list(
         search_with_progress(
@@ -377,14 +371,14 @@ def search_gemm(
 
     result_dir = os.path.join(
         output_dir,
-        f"gemm_{m}x{n}x{k}_inter{inter_node}_intra{intra_node}",
+        f"gemm_{m}x{n}x{k}_devices{num_devices}",
     )
     os.makedirs(result_dir, exist_ok=True)
 
     summary_lines = [
         (
             f"GEMM Search Results: M={m}, N={n}, K={k}, "
-            f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
+            f"num_devices={num_devices}, world_size={world_size}"
         ),
         f"Requested top_k (per mapping combination): {top_k}",
         f"Total programs searched: {len(searched_programs)}",
@@ -401,8 +395,7 @@ def search_gemm(
             f"  config.m={m}",
             f"  config.n={n}",
             f"  config.k={k}",
-            f"  config.inter_node={inter_node}",
-            f"  config.intra_node={intra_node}",
+            f"  config.num_devices={num_devices}",
             f"  config.world_size={world_size}",
             f"  config.hardware={hw_config['name']}",
             f"  config.top_k={top_k}",
@@ -419,7 +412,7 @@ def search_gemm(
     tensor_mapping_lines = [
         (
             f"GEMM Tensor Mapping: M={m}, N={n}, K={k}, "
-            f"inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}"
+            f"num_devices={num_devices}, world_size={world_size}"
         ),
         f"Hardware config: {hw_config['name']}",
         f"Tensor mapping config: {mapping_config_path}",
@@ -529,7 +522,7 @@ def search_gemm(
 
     print(
         f"Found {len(searched_programs)} program(s) for GEMM {m}x{n}x{k} "
-        f"with inter_node={inter_node}, intra_node={intra_node} "
+        f"with num_devices={num_devices} "
         f"(world_size={world_size})"
     )
     print(f"Saved top-{top_k} program(s) per mapping combination ({len(groups)} combinations, {save_count} total)")
@@ -554,16 +547,10 @@ def main() -> None:
         "--k", type=int, default=4096, help="K dimension (default: 1024)"
     )
     parser.add_argument(
-        "--inter-node",
-        type=int,
-        default=1,
-        help="Inter-node mesh dimension (default: 1)",
-    )
-    parser.add_argument(
-        "--intra-node",
+        "--num-devices",
         type=int,
         default=4,
-        help="Intra-node mesh dimension (default: 2)",
+        help="Number of devices (default: 4)",
     )
     parser.add_argument(
         "--output-dir",
@@ -586,10 +573,10 @@ def main() -> None:
     parser.add_argument(
         "--mapping-config",
         type=str,
-        default="config/gemm_tensor_mapping.json",
+        default="config/gemm_tensor_mapping_flexible.json",
         help=(
             "Tensor mapping constraint JSON path "
-            "(default: config/gemm_tensor_mapping.json)"
+            "(default: config/gemm_tensor_mapping_flexible.json)"
         ),
     )
     parser.add_argument(
@@ -611,8 +598,7 @@ def main() -> None:
         args.m,
         args.n,
         args.k,
-        args.inter_node,
-        args.intra_node,
+        args.num_devices,
         args.output_dir,
         args.top_k,
         args.hw_config,

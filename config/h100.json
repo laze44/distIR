@@ -14,13 +14,7 @@
     "capacity_gb": 80.0
   },
   "interconnect": {
-    "intra_node": {
-      "bandwidth_gb_per_s": 900.0,
-      "latency_us": 3.0
-    },
-    "inter_node": {
-      "bandwidth_gb_per_s": 100.0,
-      "latency_us": 20.0
-    }
+    "bandwidth_gb_per_s": 100.0,
+    "latency_us": 20.0
   }
 }

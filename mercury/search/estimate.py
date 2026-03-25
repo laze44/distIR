@@ -107,10 +107,8 @@ def _validate_hardware_config(config: Dict[str, Any]) -> None:
     if "capacity_gb" in config.get("memory", {}):
         _read_positive(config, ["memory", "capacity_gb"])
 
-    _read_positive(config, ["interconnect", "intra_node", "bandwidth_gb_per_s"])
-    _read_non_negative(config, ["interconnect", "intra_node", "latency_us"])
-    _read_positive(config, ["interconnect", "inter_node", "bandwidth_gb_per_s"])
-    _read_non_negative(config, ["interconnect", "inter_node", "latency_us"])
+    _read_positive(config, ["interconnect", "bandwidth_gb_per_s"])
+    _read_non_negative(config, ["interconnect", "latency_us"])
 
 
 def load_hardware_config(config_path: str) -> Dict[str, Any]:
@@ -283,55 +281,31 @@ def _normalize_topology_metadata(
         dict(program.topology_metadata) if program.topology_metadata is not None else {}
     )
 
-    if "inter_node_dims" not in metadata:
-        if num_inter_dims is None:
-            inter_node_dims = [0] if ndim > 1 else []
-        else:
-            inter_node_dims = list(range(max(0, min(ndim, num_inter_dims))))
-        metadata["inter_node_dims"] = inter_node_dims
+    if "device_dims" not in metadata:
+        metadata["device_dims"] = list(range(ndim))
 
-    inter_node_dims = _normalize_mesh_dims(metadata.get("inter_node_dims", []), ndim)
-    intra_node_dims = _normalize_mesh_dims(metadata.get("intra_node_dims", []), ndim)
+    device_dims = _normalize_mesh_dims(metadata.get("device_dims", []), ndim)
     mixed_dims = _normalize_mesh_dims(metadata.get("mixed_dims", []), ndim)
 
-    covered = set(inter_node_dims) | set(intra_node_dims) | set(mixed_dims)
+    covered = set(device_dims) | set(mixed_dims)
     for dim in range(ndim):
         if dim not in covered:
-            intra_node_dims.append(dim)
+            device_dims.append(dim)
 
     return {
-        "inter_node_dims": sorted(set(inter_node_dims)),
-        "intra_node_dims": sorted(set(intra_node_dims)),
+        "device_dims": sorted(set(device_dims)),
         "mixed_dims": sorted(set(mixed_dims)),
     }
 
 
-def _link_params(hw_config: Dict[str, Any], inter_node: bool) -> Tuple[float, float]:
-    if inter_node:
-        bandwidth = _read_positive(
-            hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]
-        ) * (10**9)
-        latency_s = _read_non_negative(
-            hw_config, ["interconnect", "inter_node", "latency_us"]
-        ) / (10**6)
-    else:
-        bandwidth = _read_positive(
-            hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]
-        ) * (10**9)
-        latency_s = _read_non_negative(
-            hw_config, ["interconnect", "intra_node", "latency_us"]
-        ) / (10**6)
+def _link_params(hw_config: Dict[str, Any]) -> Tuple[float, float]:
+    bandwidth = _read_positive(
+        hw_config, ["interconnect", "bandwidth_gb_per_s"]
+    ) * (10**9)
+    latency_s = _read_non_negative(
+        hw_config, ["interconnect", "latency_us"]
+    ) / (10**6)
     return bandwidth, latency_s
-
-
-def _is_inter_mesh_dim(mesh_dim: int, topology_metadata: Dict[str, List[int]]) -> bool:
-    if mesh_dim in topology_metadata["inter_node_dims"]:
-        return True
-    if mesh_dim in topology_metadata["intra_node_dims"]:
-        return False
-    if mesh_dim in topology_metadata["mixed_dims"]:
-        return True
-    return True
 
 
 def _estimate_collective_reduce_events(
@@ -381,10 +355,7 @@ def _estimate_collective_reduce_events(
         data_bytes = float(
             _buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype)
         )
-        inter_node = any(
-            _is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims
-        )
-        bandwidth, latency_s = _link_params(hw_config, inter_node)
+        bandwidth, latency_s = _link_params(hw_config)
 
         rounds = 2.0 * (participants - 1.0)
         transfer_factor = 2.0 * (participants - 1.0) / participants
@@ -453,10 +424,7 @@ def _estimate_async_collective_pipeline_overhead_ms(
         data_bytes = float(
             _buffer_numel(reduce_op.buffer) * get_element_size(reduce_op.buffer.dtype)
         )
-        inter_node = any(
-            _is_inter_mesh_dim(mesh_dim, topology_metadata) for mesh_dim in shard_dims
-        )
-        bandwidth, latency_s = _link_params(hw_config, inter_node)
+        bandwidth, latency_s = _link_params(hw_config)
 
         rounds = 2.0 * (participants - 1.0)
         transfer_factor = 2.0 * (participants - 1.0) / participants
@@ -504,8 +472,7 @@ def _estimate_ring_events(
             if participants <= 1:
                 continue
 
-            inter_node = _is_inter_mesh_dim(shard_dim, topology_metadata)
-            bandwidth, latency_s = _link_params(hw_config, inter_node)
+            bandwidth, latency_s = _link_params(hw_config)
 
             rounds = float(participants - 1)
             if isinstance(node, ReduceOp) and bool(

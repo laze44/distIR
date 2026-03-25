@@ -25,9 +25,9 @@ from mercury.search.topology_policy import (
     enumerate_domain_shapes,
     enumerate_topology_mesh_shapes,
     LogicalShardFactors,
-    make_gemm_flat_mesh_shape_policy,
-    make_gemm_mesh_shape_policy,
-    make_gemm_topology_spec,
+    make_flat_mesh_shape_policy,
+    make_mesh_shape_policy,
+    make_topology_spec,
     topology_metadata_for_shape,
 )
 
@@ -166,14 +166,13 @@ class TestEnumerateDomainShapes:
 
 
 class TestTopologySpec:
-    def test_auto_labels_two_domains(self):
+    def test_auto_labels_single_domain(self):
         t = TopologySpec(
             domains=[
                 DomainSpec(kind="clique", size=4),
-                DomainSpec(kind="clique", size=8),
             ]
         )
-        assert t.domain_labels == ["inter_node", "intra_node"]
+        assert t.domain_labels == ["device"]
 
     def test_auto_labels_three_domains(self):
         t = TopologySpec(
@@ -204,8 +203,8 @@ class TestTopologySpec:
 
 
 class TestEnumerateTopologyMeshShapes:
-    def test_inter16_intra1(self):
-        topology = make_gemm_topology_spec(inter_node=16, intra_node=1)
+    def test_device16(self):
+        topology = make_topology_spec(num_devices=16)
         shapes = enumerate_topology_mesh_shapes(topology)
         assert (16,) in shapes
         assert (8, 2) in shapes
@@ -213,51 +212,28 @@ class TestEnumerateTopologyMeshShapes:
         assert (2, 2, 2, 2) not in shapes
         assert len(shapes) == 3
 
-    def test_inter4_intra1(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=1)
+    def test_device4(self):
+        topology = make_topology_spec(num_devices=4)
         shapes = enumerate_topology_mesh_shapes(topology)
         assert (4,) in shapes
         assert (2, 2) in shapes
         assert len(shapes) == 2
 
-    def test_inter4_intra8_single(self):
-        topology = make_gemm_topology_spec(
-            inter_node=4,
-            intra_node=8,
-            intra_factorization="single_dim",
+    def test_device4_single_dim(self):
+        topology = make_topology_spec(
+            num_devices=4,
+            factorization="single_dim",
         )
         shapes = enumerate_topology_mesh_shapes(topology)
-        assert (4, 8) in shapes
-        assert (2, 2, 8) in shapes
-        for shape in shapes:
-            product = 1
-            for v in shape:
-                product *= v
-            assert product == 32
+        assert shapes == [(4,)]
 
-    def test_inter1_intra1(self):
-        topology = make_gemm_topology_spec(inter_node=1, intra_node=1)
+    def test_device1(self):
+        topology = make_topology_spec(num_devices=1)
         shapes = enumerate_topology_mesh_shapes(topology)
         assert shapes == [()]
 
-    def test_no_cross_domain_mixing(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=8)
-        shapes = enumerate_topology_mesh_shapes(topology)
-        for shape in shapes:
-            product = 1
-            for v in shape:
-                product *= v
-            assert product == 32
-        assert (8, 4) not in shapes
-        assert (2, 8, 2) not in shapes
-        assert (2, 4, 4) not in shapes
-
-    def test_empty_topology(self):
-        topology = TopologySpec()
-        assert enumerate_topology_mesh_shapes(topology) == [()]
-
     def test_products_match_world_size(self):
-        topology = make_gemm_topology_spec(inter_node=16, intra_node=8)
+        topology = make_topology_spec(num_devices=128)
         shapes = enumerate_topology_mesh_shapes(topology)
         for shape in shapes:
             product = 1
@@ -265,53 +241,41 @@ class TestEnumerateTopologyMeshShapes:
                 product *= v
             assert product == 128, f"Shape {shape} product != 128"
 
+    def test_empty_topology(self):
+        topology = TopologySpec()
+        assert enumerate_topology_mesh_shapes(topology) == [()]
+
 
 class TestTopologyMetadataForShape:
-    def test_inter16_single_dim(self):
-        topology = make_gemm_topology_spec(inter_node=16, intra_node=1)
+    def test_device16_single_dim(self):
+        topology = make_topology_spec(num_devices=16)
         metadata = topology_metadata_for_shape(topology, (16,))
-        assert metadata["inter_node_dims"] == [0]
-        assert metadata["intra_node_dims"] == []
-        assert metadata["mixed_dims"] == []
+        assert metadata["device_dims"] == [0]
 
-    def test_inter4_two_dims(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=1)
+    def test_device4_two_dims(self):
+        topology = make_topology_spec(num_devices=4)
         metadata = topology_metadata_for_shape(topology, (2, 2))
-        assert metadata["inter_node_dims"] == [0, 1]
-        assert metadata["intra_node_dims"] == []
-        assert metadata["mixed_dims"] == []
+        assert metadata["device_dims"] == [0, 1]
 
-    def test_inter4_intra8(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=8)
+    def test_device32(self):
+        topology = make_topology_spec(num_devices=32)
         metadata = topology_metadata_for_shape(topology, (4, 8))
-        assert metadata["inter_node_dims"] == [0]
-        assert metadata["intra_node_dims"] == [1]
-        assert metadata["mixed_dims"] == []
+        assert metadata["device_dims"] == [0, 1]
 
-    def test_inter4_factored_intra8(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=8)
+    def test_device32_three_dims(self):
+        topology = make_topology_spec(num_devices=32)
         metadata = topology_metadata_for_shape(topology, (2, 2, 8))
-        assert metadata["inter_node_dims"] == [0, 1]
-        assert metadata["intra_node_dims"] == [2]
-        assert metadata["mixed_dims"] == []
+        assert metadata["device_dims"] == [0, 1, 2]
 
-    def test_inter1_intra1(self):
-        topology = make_gemm_topology_spec(inter_node=1, intra_node=1)
+    def test_device1(self):
+        topology = make_topology_spec(num_devices=1)
         metadata = topology_metadata_for_shape(topology, ())
-        assert metadata["inter_node_dims"] == []
-        assert metadata["intra_node_dims"] == []
-        assert metadata["mixed_dims"] == []
-
-    def test_never_produces_mixed_dims(self):
-        topology = make_gemm_topology_spec(inter_node=16, intra_node=8)
-        for shape in enumerate_topology_mesh_shapes(topology):
-            metadata = topology_metadata_for_shape(topology, shape)
-            assert metadata["mixed_dims"] == [], f"mixed_dims non-empty for {shape}"
+        assert metadata["device_dims"] == []
 
 
 class TestMeshShapePolicy:
     def test_enumerate_shapes(self):
-        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_mesh_shape_policy(num_devices=16)
         shapes = policy.enumerate_shapes()
         assert (16,) in shapes
         assert (8, 2) in shapes
@@ -319,34 +283,25 @@ class TestMeshShapePolicy:
         assert len(shapes) == 3
 
     def test_topology_metadata(self):
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=8)
-        metadata = policy.topology_metadata_for_shape((2, 2, 8))
-        assert metadata["inter_node_dims"] == [0, 1]
-        assert metadata["intra_node_dims"] == [2]
+        policy = make_mesh_shape_policy(num_devices=8)
+        metadata = policy.topology_metadata_for_shape((2, 2, 2))
+        assert metadata["device_dims"] == [0, 1, 2]
 
 
-class TestMakeGemmFactories:
+class TestMakeTopologySpecFactories:
     def test_default_policies(self):
-        topology = make_gemm_topology_spec(inter_node=4, intra_node=2)
-        inter = topology.domains[0]
-        intra = topology.domains[1]
-        assert inter.factorization_policy == "rank_limited"
-        assert inter.max_virtual_dims == 2
-        assert intra.factorization_policy == "single_dim"
+        topology = make_topology_spec(num_devices=8)
+        device_domain = topology.domains[0]
+        assert device_domain.factorization_policy == "rank_limited"
+        assert device_domain.max_virtual_dims == 2
 
     def test_custom_policies(self):
-        topology = make_gemm_topology_spec(
-            inter_node=8,
-            intra_node=4,
-            inter_factorization="single_dim",
-            intra_factorization="rank_limited",
-            intra_max_virtual_dims=3,
+        topology = make_topology_spec(
+            num_devices=8,
+            factorization="single_dim",
         )
-        inter = topology.domains[0]
-        intra = topology.domains[1]
-        assert inter.factorization_policy == "single_dim"
-        assert intra.factorization_policy == "rank_limited"
-        assert intra.max_virtual_dims == 3
+        device_domain = topology.domains[0]
+        assert device_domain.factorization_policy == "single_dim"
 
 
 if __name__ == "__main__":
@@ -383,12 +338,12 @@ def _extract_shard_specs(program: Program) -> Set[Tuple]:
 class TestGEMMLayoutCoverage:
     """Phase 3: Verify policy preserves layout expressiveness for GEMM."""
 
-    def test_inter4_layout_coverage(self):
-        # GIVEN inter_node=4 clique with rank_limited policy
+    def test_device4_layout_coverage(self):
+        # GIVEN num_devices=4 clique with rank_limited policy
         # WHEN we search with the policy
         # THEN mesh shapes (4,) and (2,2) must both appear,
         # and layout assignments must cover (4,1), (2,2), (1,4) sharding patterns
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=1)
+        policy = make_mesh_shape_policy(num_devices=4)
         shapes = policy.enumerate_shapes()
         assert (4,) in shapes
         assert (2, 2) in shapes
@@ -419,25 +374,25 @@ class TestGEMMLayoutCoverage:
         assert len(b_shard_configs) > 1, "B should have multiple shard patterns"
         assert len(c_shard_configs) > 1, "C should have multiple shard patterns"
 
-    def test_inter16_no_4d_shapes(self):
-        # GIVEN inter_node=16 with default GEMM policy
+    def test_device16_no_4d_shapes(self):
+        # GIVEN num_devices=16 with default GEMM policy
         # WHEN we enumerate shapes
         # THEN (2,2,2,2) must NOT appear
-        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_mesh_shape_policy(num_devices=16)
         shapes = policy.enumerate_shapes()
         assert (2, 2, 2, 2) not in shapes
         for shape in shapes:
             assert len(shape) <= 2, f"Shape {shape} exceeds 2 dims"
 
-    def test_inter16_candidate_count_regression(self):
-        # GIVEN inter_node=16, intra_node=1
+    def test_device16_candidate_count_regression(self):
+        # GIVEN num_devices=16
         # WHEN we search with vs without policy
         # THEN policy produces fewer candidates (no 4D explosion)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(16))
         mesh = DeviceMesh(devices, (16,))
 
-        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_mesh_shape_policy(num_devices=16)
 
         policy_candidates = list(
             search(
@@ -467,11 +422,11 @@ class TestGEMMLayoutCoverage:
     def test_policy_topology_metadata_is_deterministic(self):
         # GIVEN candidates produced with policy
         # WHEN we check topology_metadata
-        # THEN all candidates have non-None metadata with no mixed_dims
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
+        # THEN all candidates have non-None metadata with device_dims
+        policy = make_mesh_shape_policy(num_devices=8)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(8))
-        mesh = DeviceMesh(devices, (4, 2))
+        mesh = DeviceMesh(devices, (8,))
 
         candidates = list(
             search(
@@ -486,20 +441,16 @@ class TestGEMMLayoutCoverage:
         for cand in candidates:
             meta = cand.topology_metadata
             assert meta is not None, "topology_metadata should be set by policy"
-            assert "inter_node_dims" in meta
-            assert "intra_node_dims" in meta
-            assert meta["mixed_dims"] == [], (
-                f"Policy should never produce mixed_dims, got {meta}"
-            )
+            assert "device_dims" in meta
 
     def test_policy_preserves_multiple_layout_classes(self):
-        # GIVEN policy for inter_node=4, intra_node=2
+        # GIVEN policy for num_devices=8
         # WHEN we search with dedupe
         # THEN at least 2 distinct dedupe keys exist (multiple layout classes)
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
+        policy = make_mesh_shape_policy(num_devices=8)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(8))
-        mesh = DeviceMesh(devices, (4, 2))
+        mesh = DeviceMesh(devices, (8,))
 
         candidates = list(
             search(
@@ -545,10 +496,10 @@ class TestPhase4EstimatorAlignment:
         # THEN it passes through without alteration
         from mercury.search.estimate import _normalize_topology_metadata
 
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
+        policy = make_mesh_shape_policy(num_devices=8)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(8))
-        mesh = DeviceMesh(devices, (4, 2))
+        mesh = DeviceMesh(devices, (8,))
 
         candidates = list(
             search(program, mesh, ["I", "J", "K"], mesh_shape_policy=policy)
@@ -558,112 +509,58 @@ class TestPhase4EstimatorAlignment:
         for cand in candidates:
             normalized = _normalize_topology_metadata(cand, num_inter_dims=None)
             policy_meta = cand.topology_metadata
-            assert normalized["inter_node_dims"] == sorted(
-                policy_meta["inter_node_dims"]
+            assert normalized["device_dims"] == sorted(
+                policy_meta["device_dims"]
             )
-            assert normalized["mixed_dims"] == []
-
-    def test_is_inter_mesh_dim_with_policy_metadata(self):
-        # GIVEN policy metadata for inter_node=4, intra_node=2
-        # WHEN _is_inter_mesh_dim checks each dim
-        # THEN inter dims return True, intra dims return False
-        from mercury.search.estimate import _is_inter_mesh_dim
-
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
-        for shape in policy.enumerate_shapes():
-            meta = policy.topology_metadata_for_shape(shape)
-            for dim in meta.get("inter_node_dims", []):
-                assert _is_inter_mesh_dim(dim, meta) is True
-            for dim in meta.get("intra_node_dims", []):
-                assert _is_inter_mesh_dim(dim, meta) is False
 
 
 class TestPhase4MappingConstraintsAlignment:
     """Phase 4: Verify policy metadata works with mapping_constraints.py."""
 
-    def test_resolve_topology_tokens_inter(self):
-        # GIVEN policy metadata for inter_node=4, intra_node=2 with shape (2, 2, 2)
-        # WHEN resolving "inter_node" token
-        # THEN returns the inter dims from policy metadata
+    def test_resolve_topology_tokens_device(self):
+        # GIVEN policy metadata for num_devices=8 with shape (2, 2, 2)
+        # WHEN resolving "device" token
+        # THEN returns the device dims from policy metadata
         from mercury.search.mapping_constraints import (
             resolve_topology_tokens_from_metadata,
         )
 
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
+        policy = make_mesh_shape_policy(num_devices=8)
         meta = policy.topology_metadata_for_shape((2, 2, 2))
-        resolved = resolve_topology_tokens_from_metadata(meta, ("inter_node",))
-        assert resolved == tuple(sorted(meta["inter_node_dims"]))
-
-    def test_resolve_topology_tokens_intra(self):
-        # GIVEN policy metadata for inter_node=4, intra_node=2 with shape (4, 2)
-        # WHEN resolving "intra_node" token
-        # THEN returns the intra dims from policy metadata
-        from mercury.search.mapping_constraints import (
-            resolve_topology_tokens_from_metadata,
-        )
-
-        policy = make_gemm_mesh_shape_policy(inter_node=4, intra_node=2)
-        meta = policy.topology_metadata_for_shape((4, 2))
-        resolved = resolve_topology_tokens_from_metadata(meta, ("intra_node",))
-        assert resolved == tuple(sorted(meta["intra_node_dims"]))
-
-    def test_resolve_topology_tokens_mixed_empty(self):
-        # GIVEN policy metadata (mixed_dims always empty)
-        # WHEN resolving "mixed" token
-        # THEN returns empty tuple
-        from mercury.search.mapping_constraints import (
-            resolve_topology_tokens_from_metadata,
-        )
-
-        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
-        for shape in policy.enumerate_shapes():
-            meta = policy.topology_metadata_for_shape(shape)
-            resolved = resolve_topology_tokens_from_metadata(meta, ("mixed",))
-            assert resolved == ()
+        resolved = resolve_topology_tokens_from_metadata(meta, ("device",))
+        assert resolved == tuple(sorted(meta["device_dims"]))
 
 
 class TestPhase4TwoStepAlignment:
     """Phase 4: Verify policy metadata matches _fixed_topology_metadata for default cases."""
 
     def test_single_dim_mesh_matches(self):
-        # GIVEN mesh shape (N,) where N is the inter_node size
+        # GIVEN mesh shape (N,) where N is the num_devices
         # WHEN comparing _fixed_topology_metadata vs policy metadata
-        # THEN for 1D meshes, _fixed_topology_metadata classifies dim 0 as intra
-        #   while policy correctly classifies it as inter — this is a known
-        #   divergence that will be resolved when two-step migrates to the policy
+        # THEN both classify all dims as device dims
         from mercury.search.gemm_two_step_search import _fixed_topology_metadata
 
-        for inter_node in (2, 4, 8, 16):
-            policy = make_gemm_mesh_shape_policy(inter_node=inter_node, intra_node=1)
-            shape = (inter_node,)
+        for num_devices in (2, 4, 8, 16):
+            policy = make_mesh_shape_policy(num_devices=num_devices)
+            shape = (num_devices,)
             fixed = _fixed_topology_metadata(shape)
             policy_meta = policy.topology_metadata_for_shape(shape)
-            assert fixed["inter_node_dims"] == []
-            assert fixed["intra_node_dims"] == [0]
-            assert policy_meta["inter_node_dims"] == [0]
-            assert policy_meta["intra_node_dims"] == []
-            assert fixed["mixed_dims"] == policy_meta["mixed_dims"] == []
+            assert fixed["device_dims"] == [0]
+            assert policy_meta["device_dims"] == [0]
 
-    def test_two_dim_inter_intra_matches(self):
-        # GIVEN mesh shape (inter, intra)
+    def test_two_dim_mesh_matches(self):
+        # GIVEN mesh shape (a, b) where a*b == num_devices
         # WHEN comparing _fixed_topology_metadata vs policy metadata
-        # THEN they produce equivalent results
+        # THEN they produce equivalent results (all dims are device dims)
         from mercury.search.gemm_two_step_search import _fixed_topology_metadata
 
-        for inter_node, intra_node in [(4, 2), (8, 4), (2, 8)]:
-            policy = make_gemm_mesh_shape_policy(
-                inter_node=inter_node, intra_node=intra_node
-            )
-            shape = (inter_node, intra_node)
+        for num_devices, shape in [(8, (4, 2)), (32, (8, 4)), (16, (2, 8))]:
+            policy = make_mesh_shape_policy(num_devices=num_devices)
             fixed = _fixed_topology_metadata(shape)
             policy_meta = policy.topology_metadata_for_shape(shape)
-            assert fixed["inter_node_dims"] == policy_meta["inter_node_dims"], (
+            assert fixed["device_dims"] == policy_meta["device_dims"], (
                 f"Mismatch for shape {shape}"
             )
-            assert fixed["intra_node_dims"] == policy_meta["intra_node_dims"], (
-                f"Mismatch for shape {shape}"
-            )
-            assert fixed["mixed_dims"] == policy_meta["mixed_dims"]
 
 
 class TestLogicalShardFactors:
@@ -673,76 +570,66 @@ class TestLogicalShardFactors:
         # GIVEN a fully replicated buffer (all specs are R)
         specs = (("R", ()), ("R", ()))
         mesh_shape = (4, 2)
-        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+        metadata = {"device_dims": [0, 1]}
 
         factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
         assert factors.domain_factors == {}
         assert factors.to_summary() == "replicated"
 
-    def test_single_dim_shard_on_inter_node(self):
-        # GIVEN buffer sharded on dim 0 via mesh dim 0 (inter_node)
+    def test_single_dim_shard_on_device(self):
+        # GIVEN buffer sharded on dim 0 via mesh dim 0 (device)
         specs = (("S", (0,)), ("R", ()))
         mesh_shape = (4, 2)
-        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+        metadata = {"device_dims": [0, 1]}
 
         factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
-        assert factors.domain_factors == {"inter_node": (4,)}
-        assert factors.total_factor("inter_node") == 4
-        assert factors.total_factor("intra_node") == 1
+        assert factors.domain_factors == {"device": (4,)}
+        assert factors.total_factor("device") == 4
 
-    def test_two_dim_shard_on_inter_node(self):
+    def test_two_dim_shard_on_device(self):
         # GIVEN buffer sharded on dim 0 via mesh dim 0, dim 1 via mesh dim 1
-        # WHEN mesh (8, 2) with both dims belonging to inter_node
+        # WHEN mesh (8, 2) with both dims belonging to device
         specs = (("S", (0,)), ("S", (1,)))
         mesh_shape = (8, 2)
-        metadata = {"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []}
+        metadata = {"device_dims": [0, 1]}
 
         factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
-        assert factors.domain_factors == {"inter_node": (8, 2)}
-        assert factors.total_factor("inter_node") == 16
+        assert factors.domain_factors == {"device": (8, 2)}
+        assert factors.total_factor("device") == 16
 
-    def test_cross_domain_shard(self):
-        # GIVEN buffer sharded dim 0 on inter (dim 0), dim 1 on intra (dim 1)
+    def test_cross_domain_shard_single_domain(self):
+        # GIVEN buffer sharded dim 0 on device (dim 0), dim 1 on device (dim 1)
         specs = (("S", (0,)), ("S", (1,)))
         mesh_shape = (4, 2)
-        metadata = {"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []}
+        metadata = {"device_dims": [0, 1]}
 
         factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
-        assert factors.domain_factors == {"inter_node": (4,), "intra_node": (2,)}
-        assert factors.total_factor("inter_node") == 4
-        assert factors.total_factor("intra_node") == 2
+        assert factors.domain_factors == {"device": (4, 2)}
+        assert factors.total_factor("device") == 8
 
     def test_multi_mesh_dim_on_one_tensor_dim(self):
         # GIVEN buffer with one tensor dim sharded across mesh dims 0 and 1
-        # (both belonging to inter_node), e.g. S(0,1) on dim 0
+        # (both belonging to device), e.g. S(0,1) on dim 0
         specs = (("S", (0, 1)), ("R", ()))
         mesh_shape = (4, 4)
-        metadata = {"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []}
+        metadata = {"device_dims": [0, 1]}
 
         factors = compute_buffer_logical_shard_factors(specs, mesh_shape, metadata)
-        # Both mesh dims contribute to inter_node
-        assert factors.domain_factors == {"inter_node": (4, 4)}
-        assert factors.total_factor("inter_node") == 16
+        # Both mesh dims contribute to device
+        assert factors.domain_factors == {"device": (4, 4)}
+        assert factors.total_factor("device") == 16
 
     def test_summary_format(self):
-        lsf = LogicalShardFactors(domain_factors={"inter_node": (2, 8)})
-        assert lsf.to_summary() == "inter_node=(2, 8)"
+        lsf = LogicalShardFactors(domain_factors={"device": (2, 8)})
+        assert lsf.to_summary() == "device=(2, 8)"
 
     def test_empty_factors_summary(self):
         lsf = LogicalShardFactors(domain_factors={})
         assert lsf.to_summary() == "replicated"
 
-    def test_multi_domain_summary_sorted(self):
-        lsf = LogicalShardFactors(
-            domain_factors={"intra_node": (2,), "inter_node": (4,)}
-        )
-        summary = lsf.to_summary()
-        # Should be sorted by domain label
-        assert summary.index("inter_node") < summary.index("intra_node")
-
-    def test_inter16_logical_factor_coverage(self):
-        """Integration: inter_node=16 search produces diverse A tilings."""
-        policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+    def test_device16_logical_factor_coverage(self):
+        """Integration: num_devices=16 search produces diverse A tilings."""
+        policy = make_mesh_shape_policy(num_devices=16)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(16))
         mesh = DeviceMesh(devices, (16,))
@@ -763,11 +650,11 @@ class TestLogicalShardFactors:
             logical_factors = compute_program_logical_shard_factors(cand)
             a_factors = logical_factors.get("A")
             if a_factors is not None:
-                inter_tuple = a_factors.domain_factors.get("inter_node", ())
-                if inter_tuple:
-                    a_factor_patterns.add(inter_tuple)
+                device_tuple = a_factors.domain_factors.get("device", ())
+                if device_tuple:
+                    a_factor_patterns.add(device_tuple)
 
-        # With inter_node=16 and mesh shapes (16,), (8,2), (4,4),
+        # With num_devices=16 and mesh shapes (16,), (8,2), (4,4),
         # we should see diverse A tiling patterns
         assert len(a_factor_patterns) >= 2, (
             f"Expected diverse A tiling patterns, got {a_factor_patterns}"
@@ -778,44 +665,28 @@ class TestFlatMeshShapePolicy:
     """Tests for FlatMeshShapePolicy and the flat search path."""
 
     def test_flat_policy_enumerate_shapes_single_domain(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=16)
         shapes = policy.enumerate_shapes()
         assert shapes == [(16,)]
 
-    def test_flat_policy_enumerate_shapes_two_domains(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=2)
-        shapes = policy.enumerate_shapes()
-        assert shapes == [(4, 2)]
-
     def test_flat_policy_is_flat_mesh_shape_policy(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=16)
         assert isinstance(policy, FlatMeshShapePolicy)
         assert isinstance(policy, MeshShapePolicy)
 
     def test_flat_topology_metadata_single_domain(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
-        # Virtual mesh (4, 4) -> both dims belong to inter_node
+        policy = make_flat_mesh_shape_policy(num_devices=16)
+        # Virtual mesh (4, 4) -> both dims belong to device
         meta = policy.topology_metadata_for_shape((4, 4))
-        assert meta["inter_node_dims"] == [0, 1]
-        assert meta["intra_node_dims"] == []
-        assert meta["mixed_dims"] == []
-
-    def test_flat_topology_metadata_two_domains(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=2)
-        # Virtual mesh (2, 2, 2) -> first two dims are inter (2*2=4), third is intra
-        meta = policy.topology_metadata_for_shape((2, 2, 2))
-        assert meta["inter_node_dims"] == [0, 1]
-        assert meta["intra_node_dims"] == [2]
-        assert meta["mixed_dims"] == []
+        assert meta["device_dims"] == [0, 1]
 
     def test_flat_topology_metadata_single_dim(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=16)
         meta = policy.topology_metadata_for_shape((16,))
-        assert meta["inter_node_dims"] == [0]
-        assert meta["intra_node_dims"] == []
+        assert meta["device_dims"] == [0]
 
     def test_flat_search_produces_candidates(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=4)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(4))
         mesh = DeviceMesh(devices, (4,))
@@ -832,7 +703,7 @@ class TestFlatMeshShapePolicy:
         assert len(candidates) > 0
 
     def test_flat_search_all_have_topology_metadata(self):
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=4, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=4)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(4))
         mesh = DeviceMesh(devices, (4,))
@@ -847,23 +718,22 @@ class TestFlatMeshShapePolicy:
         )
         for cand in candidates:
             assert cand.topology_metadata is not None
-            assert "inter_node_dims" in cand.topology_metadata
-            assert cand.topology_metadata["mixed_dims"] == []
+            assert "device_dims" in cand.topology_metadata
 
-    def test_flat_search_with_fixed_b_constraint_inter16(self):
-        """Core test: flat policy + B fixed factor=4,4 on inter_node=16."""
+    def test_flat_search_with_fixed_b_constraint_device16(self):
+        """Core test: flat policy + B K-dim fixed factor=8 on device=16."""
         from mercury.search.mapping_constraints import (
             load_tensor_mapping_constraints,
             program_satisfies_tensor_mapping_constraints,
         )
 
-        policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        policy = make_flat_mesh_shape_policy(num_devices=16)
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(16))
-        mesh = DeviceMesh(devices, (16, 1))
+        mesh = DeviceMesh(devices, (16,))
 
         constraints = load_tensor_mapping_constraints(
-            "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+            "config/gemm_tensor_mapping_fixed_b_device.json"
         )
 
         candidates = list(
@@ -883,15 +753,15 @@ class TestFlatMeshShapePolicy:
         for cand in candidates:
             assert program_satisfies_tensor_mapping_constraints(cand, constraints)
 
-        # A should have more than 1 inter_node factor pattern
+        # A should have more than 1 device factor pattern
         a_factor_patterns: Set[Tuple[int, ...]] = set()
         for cand in candidates:
             factors = compute_program_logical_shard_factors(cand)
             a_factors = factors.get("A")
             if a_factors is not None:
-                inter_tuple = a_factors.domain_factors.get("inter_node", ())
-                if inter_tuple:
-                    a_factor_patterns.add(inter_tuple)
+                device_tuple = a_factors.domain_factors.get("device", ())
+                if device_tuple:
+                    a_factor_patterns.add(device_tuple)
 
         assert len(a_factor_patterns) >= 2, (
             f"Flat policy should unlock more A tiling diversity, "
@@ -906,14 +776,14 @@ class TestFlatMeshShapePolicy:
 
         program = _parse_gemm_program(256, 256, 256)
         devices = list(range(16))
-        mesh = DeviceMesh(devices, (16, 1))
+        mesh = DeviceMesh(devices, (16,))
 
         constraints = load_tensor_mapping_constraints(
-            "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+            "config/gemm_tensor_mapping_fixed_b_device.json"
         )
 
         # Flat policy
-        flat_policy = make_gemm_flat_mesh_shape_policy(inter_node=16, intra_node=1)
+        flat_policy = make_flat_mesh_shape_policy(num_devices=16)
         flat_candidates = list(
             search(
                 program,
@@ -926,7 +796,7 @@ class TestFlatMeshShapePolicy:
         )
 
         # Old policy
-        old_policy = make_gemm_mesh_shape_policy(inter_node=16, intra_node=1)
+        old_policy = make_mesh_shape_policy(num_devices=16)
         old_candidates = list(
             search(
                 program,
@@ -945,9 +815,9 @@ class TestFlatMeshShapePolicy:
                 factors = compute_program_logical_shard_factors(cand)
                 a_factors = factors.get("A")
                 if a_factors is not None:
-                    inter_tuple = a_factors.domain_factors.get("inter_node", ())
-                    if inter_tuple:
-                        patterns.add(inter_tuple)
+                    device_tuple = a_factors.domain_factors.get("device", ())
+                    if device_tuple:
+                        patterns.add(device_tuple)
             return patterns
 
         flat_a_patterns = _collect_a_patterns(flat_candidates)

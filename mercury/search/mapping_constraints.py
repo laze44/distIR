@@ -14,7 +14,7 @@ from mercury.ir.utils import get_io_buffers
 
 _SUPPORTED_MATRICES = ("A", "B", "C")
 _SUPPORTED_MODES = ("flexible", "fixed")
-_SUPPORTED_TOPOLOGY_TOKENS = ("inter_node", "intra_node", "mixed")
+_SUPPORTED_TOPOLOGY_TOKENS = ("device",)
 _SUPPORTED_OPERATORS = ("gate", "up", "down")
 
 
@@ -650,7 +650,7 @@ def logical_shard_factor_for_dim(
             e.g. ``("R", ())`` or ``("S", (0, 1))``.
         mesh_shape: The mesh shape the buffer lives on.
         topology_dims: The mesh dim indices belonging to the target
-            physical domain (e.g. the ``inter_node_dims``).
+            physical domain (e.g. the ``device_dims``).
 
     Returns:
         The product of mesh extents along the intersection of the
@@ -687,8 +687,8 @@ def program_satisfies_logical_factor_constraints(
             Example::
 
                 {
-                    "A": {"inter_node": (2, 8)},
-                    "B": {"inter_node": (4, 4)},
+                    "A": {"device": (2, 8)},
+                    "B": {"device": (4, 4)},
                 }
 
     Returns:

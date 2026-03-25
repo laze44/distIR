@@ -167,8 +167,8 @@ def _make_test_hw_config():
             "bandwidth_tb_per_s": 1.0,
         },
         "interconnect": {
-            "intra_node": {"bandwidth_gb_per_s": 100.0, "latency_us": 1.0},
-            "inter_node": {"bandwidth_gb_per_s": 50.0, "latency_us": 2.0},
+            "bandwidth_gb_per_s": 100.0,
+            "latency_us": 1.0,
         },
     }
 

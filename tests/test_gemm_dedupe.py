@@ -121,14 +121,10 @@ class TestDuplicateEquivalenceClasses:
 
         # set topology metadata
         program_unsplit.topology_metadata = {
-            "inter_node_dims": [],
-            "intra_node_dims": [0],
-            "mixed_dims": [],
+            "device_dims": [0],
         }
         program_split.topology_metadata = {
-            "inter_node_dims": [],
-            "intra_node_dims": [0],
-            "mixed_dims": [],
+            "device_dims": [0],
         }
 
         # annotate blocking collective strategy

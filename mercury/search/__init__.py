@@ -47,6 +47,6 @@ from .topology_policy import (
     TopologySpec,
     compute_buffer_logical_shard_factors,
     compute_program_logical_shard_factors,
-    make_gemm_mesh_shape_policy,
-    make_gemm_topology_spec,
+    make_mesh_shape_policy,
+    make_topology_spec,
 )

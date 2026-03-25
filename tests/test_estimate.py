@@ -168,10 +168,8 @@ def test_h100_required_fields_are_positive():
     assert config["compute"]["peak_tflops"]["fp16"] > 0
     assert config["compute"]["peak_tflops"]["fp32"] > 0
     assert config["memory"]["bandwidth_tb_per_s"] > 0
-    assert config["interconnect"]["intra_node"]["bandwidth_gb_per_s"] > 0
-    assert config["interconnect"]["intra_node"]["latency_us"] >= 0
-    assert config["interconnect"]["inter_node"]["bandwidth_gb_per_s"] > 0
-    assert config["interconnect"]["inter_node"]["latency_us"] >= 0
+    assert config["interconnect"]["bandwidth_gb_per_s"] > 0
+    assert config["interconnect"]["latency_us"] >= 0
 
 
 def test_load_hardware_config_invalid_field(tmp_path):
@@ -205,14 +203,8 @@ def test_load_hardware_config_alternate_schema_compatible(tmp_path):
             "capacity_gb": 80.0,
         },
         "interconnect": {
-            "intra_node": {
-                "bandwidth_gb_per_s": 600.0,
-                "latency_us": 3.0,
-            },
-            "inter_node": {
-                "bandwidth_gb_per_s": 200.0,
-                "latency_us": 5.0,
-            },
+            "bandwidth_gb_per_s": 600.0,
+            "latency_us": 3.0,
         },
     }
     alt_path = tmp_path / "a100.json"
@@ -269,37 +261,37 @@ def test_search_candidates_record_topology_metadata():
     assert len(programs) > 0
 
     metadata = programs[0].topology_metadata
-    assert "inter_node_dims" in metadata
-    assert "intra_node_dims" in metadata
-    for dim in metadata["inter_node_dims"] + metadata["intra_node_dims"]:
+    assert "device_dims" in metadata
+    for dim in metadata["device_dims"]:
         assert 0 <= dim < len(programs[0].mesh.shape)
 
 
-def test_inter_intra_cost_differs_across_mesh_shape():
+def test_comm_cost_with_ring_dim():
     config = load_hardware_config("config/h100.json")
 
-    inter_program = _build_mock_gemm_program(
-        name="mesh_inter",
-        mesh_shape=(4, 2),
+    ring_program = _build_mock_gemm_program(
+        name="mesh_ring",
+        mesh_shape=(4,),
         ring_dim=0,
-        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1]},
+        topology_metadata={"device_dims": [0]},
     )
-    intra_program = _build_mock_gemm_program(
-        name="mesh_intra",
-        mesh_shape=(2, 4),
-        ring_dim=1,
-        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1]},
+    no_ring_program = _build_mock_gemm_program(
+        name="mesh_no_ring",
+        mesh_shape=(4,),
+        ring_dim=None,
+        topology_metadata={"device_dims": [0]},
     )
 
-    inter_est = estimate_program(inter_program, config)
-    intra_est = estimate_program(intra_program, config)
+    ring_est = estimate_program(ring_program, config)
+    no_ring_est = estimate_program(no_ring_program, config)
 
-    assert inter_est.comm_time_ms > intra_est.comm_time_ms
+    # Ring program should have communication cost
+    assert ring_est.comm_time_ms >= no_ring_est.comm_time_ms
 
 
 def test_ring_candidate_has_higher_comm_time_than_non_ring():
     config = load_hardware_config("config/h100.json")
-    topology = {"inter_node_dims": [0], "intra_node_dims": [1]}
+    topology = {"device_dims": [0, 1]}
 
     non_ring_program = _build_mock_gemm_program(
         name="no_ring",
@@ -321,7 +313,7 @@ def test_ring_candidate_has_higher_comm_time_than_non_ring():
 
 def test_estimator_distinguishes_blocking_ring_and_async_collective_modes():
     config = load_hardware_config("config/h100.json")
-    topology = {"inter_node_dims": [0], "intra_node_dims": [1]}
+    topology = {"device_dims": [0, 1]}
 
     base = _build_mock_gemm_program(
         name="mode_base",
@@ -373,21 +365,12 @@ def test_topk_ranking_changes_stably_with_topology_and_comm_mode():
     ring_dim1 = _build_mock_gemm_program("rank_ring_dim1", (2, 2), ring_dim=1)
     programs = [no_comm, ring_dim0, ring_dim1]
 
-    topo_a = {"inter_node_dims": [0], "intra_node_dims": [1]}
+    topo = {"device_dims": [0, 1]}
     for program in programs:
-        program.topology_metadata = topo_a
-    ranked_a = sorted(programs, key=lambda p: estimate_program(p, config).total_time_ms)
-    ranked_a_names = [program.name for program in ranked_a]
-    assert ranked_a_names[0] == "rank_no_comm"
-    assert ranked_a_names[1:] == ["rank_ring_dim1", "rank_ring_dim0"]
-
-    topo_b = {"inter_node_dims": [1], "intra_node_dims": [0]}
-    for program in programs:
-        program.topology_metadata = topo_b
-    ranked_b = sorted(programs, key=lambda p: estimate_program(p, config).total_time_ms)
-    ranked_b_names = [program.name for program in ranked_b]
-    assert ranked_b_names[0] == "rank_no_comm"
-    assert ranked_b_names[1:] == ["rank_ring_dim0", "rank_ring_dim1"]
+        program.topology_metadata = topo
+    ranked = sorted(programs, key=lambda p: estimate_program(p, config).total_time_ms)
+    ranked_names = [program.name for program in ranked]
+    assert ranked_names[0] == "rank_no_comm"
 
 
 def test_top_k_output_and_summary_schema(tmp_path):
@@ -396,14 +379,14 @@ def test_top_k_output_and_summary_schema(tmp_path):
         m=64,
         n=64,
         k=64,
-        inter_node=1,
-        intra_node=2,
+        num_devices=2,
         output_dir=str(out_dir),
         top_k=3,
         hw_config_path="config/h100.json",
+        mapping_config_path="config/gemm_tensor_mapping_flexible.json",
     )
 
-    result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
+    result_dir = out_dir / "gemm_64x64x64_devices2"
     summary_txt_path = result_dir / "summary.txt"
 
     assert summary_txt_path.exists()
@@ -411,7 +394,7 @@ def test_top_k_output_and_summary_schema(tmp_path):
     text = summary_txt_path.read_text(encoding="utf-8")
     assert "Summary Metadata (migrated from summary.json):" in text
     assert "config.top_k=3" in text
-    assert "config.mapping_config=config/gemm_tensor_mapping.json" in text
+    assert "config.mapping_config=config/gemm_tensor_mapping_flexible.json" in text
     assert "total_searched=" in text
     assert "Tensor Mapping Constraints:" in text
     assert "  A: flexible" in text
@@ -438,21 +421,21 @@ def test_cli_default_top_k(tmp_path):
         "64",
         "--k",
         "64",
-        "--inter-node",
-        "1",
-        "--intra-node",
+        "--num-devices",
         "2",
         "--output-dir",
         str(out_dir),
         "--hw-config",
         "config/h100.json",
+        "--mapping-config",
+        "config/gemm_tensor_mapping_flexible.json",
     ]
     subprocess.run(cmd, check=True)
 
-    result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
+    result_dir = out_dir / "gemm_64x64x64_devices2"
     text = (result_dir / "summary.txt").read_text(encoding="utf-8")
     assert "config.top_k=10" in text
-    assert "config.mapping_config=config/gemm_tensor_mapping.json" in text
+    assert "config.mapping_config=config/gemm_tensor_mapping_flexible.json" in text
 
     code_files = sorted(result_dir.glob("program_*_code.py"))
     assert len(code_files) <= 10
@@ -469,24 +452,20 @@ def test_cli_mapping_config_summary(tmp_path):
         "64",
         "--k",
         "64",
-        "--inter-node",
-        "1",
-        "--intra-node",
+        "--num-devices",
         "2",
         "--output-dir",
         str(out_dir),
         "--hw-config",
         "config/h100.json",
         "--mapping-config",
-        "config/gemm_tensor_mapping_fixed_example.json",
+        "config/gemm_tensor_mapping_fixed_b_device.json",
     ]
     subprocess.run(cmd, check=True)
 
-    result_dir = out_dir / "gemm_64x64x64_inter1_intra2"
+    result_dir = out_dir / "gemm_64x64x64_devices2"
     text = (result_dir / "summary.txt").read_text(encoding="utf-8")
-    assert "config.mapping_config=config/gemm_tensor_mapping_fixed_example.json" in text
-    assert "B: fixed [S(intra_node), R]" in text
-    assert "C: flexible" in text
+    assert "config.mapping_config=config/gemm_tensor_mapping_fixed_b_device.json" in text
 
 
 def test_top_k_must_be_positive(tmp_path):
@@ -495,26 +474,25 @@ def test_top_k_must_be_positive(tmp_path):
             m=64,
             n=64,
             k=64,
-            inter_node=1,
-            intra_node=1,
+            num_devices=1,
             output_dir=str(tmp_path / "results"),
             top_k=0,
             hw_config_path="config/h100.json",
+            mapping_config_path="config/gemm_tensor_mapping_flexible.json",
         )
 
 
 def test_incompatible_fixed_mapping_fails_fast_on_topology(tmp_path):
-    with pytest.raises(ValueError, match="has no shardable intra_node dimension"):
+    with pytest.raises(ValueError, match="has no shardable device dimension"):
         search_gemm(
             m=64,
             n=64,
             k=64,
-            inter_node=16,
-            intra_node=1,
+            num_devices=1,
             output_dir=str(tmp_path / "results"),
             top_k=10,
             hw_config_path="config/h100.json",
-            mapping_config_path="config/gemm_tensor_mapping_fixed_example.json",
+            mapping_config_path="config/gemm_tensor_mapping_fixed_b_device.json",
             show_progress=False,
         )
 

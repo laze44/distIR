@@ -46,8 +46,8 @@ class HWConfig:
             peak_tflops_fp8=cfg["compute"]["peak_tflops"]["fp8"],
             mem_bw_tb_s=cfg["memory"]["bandwidth_tb_per_s"],
             mem_capacity_gb=cfg["memory"]["capacity_gb"],
-            inter_bw_gb_s=cfg["interconnect"]["inter_node"]["bandwidth_gb_per_s"],
-            inter_latency_us=cfg["interconnect"]["inter_node"]["latency_us"],
+            inter_bw_gb_s=cfg["interconnect"]["bandwidth_gb_per_s"],
+            inter_latency_us=cfg["interconnect"]["latency_us"],
         )
 
 

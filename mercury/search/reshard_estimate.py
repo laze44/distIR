@@ -182,16 +182,6 @@ def _pick_nearest_source(
     return min(current_src_rank, candidate_src_rank)
 
 
-def _is_inter_node(src_rank: int, dst_rank: int, origin_mesh: DeviceMesh) -> bool:
-    if src_rank == dst_rank:
-        return False
-    if len(origin_mesh.shape) <= 1:
-        return False
-    src_coords = _one_dim_to_n_dim(src_rank, origin_mesh.shape)
-    dst_coords = _one_dim_to_n_dim(dst_rank, origin_mesh.shape)
-    return src_coords[0] != dst_coords[0]
-
-
 def estimate_reshard_time(
     src_buffer: Buffer,
     dst_buffer: Buffer,
@@ -227,17 +217,11 @@ def estimate_reshard_time(
     dst_mesh_shape = tuple(int(v) for v in dst_mesh.shape)
 
     element_size = int(get_element_size(src_buffer.dtype))
-    inter_bw = _read_positive(
-        hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]
+    bandwidth = _read_positive(
+        hw_config, ["interconnect", "bandwidth_gb_per_s"]
     ) * (10 ** 9)
-    intra_bw = _read_positive(
-        hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]
-    ) * (10 ** 9)
-    inter_latency = _read_non_negative(
-        hw_config, ["interconnect", "inter_node", "latency_us"]
-    ) / (10 ** 6)
-    intra_latency = _read_non_negative(
-        hw_config, ["interconnect", "intra_node", "latency_us"]
+    latency = _read_non_negative(
+        hw_config, ["interconnect", "latency_us"]
     ) / (10 ** 6)
 
     max_rank_time_s = 0.0
@@ -268,27 +252,19 @@ def estimate_reshard_time(
         if not _is_fully_covered(target_range, overlap_ranges):
             raise ValueError("Source ranges cannot fully cover destination shard")
 
-        inter_bytes = 0
-        intra_bytes = 0
-        inter_msgs = 0
-        intra_msgs = 0
+        total_bytes = 0
+        total_msgs = 0
         for overlap_key, src_rank in source_for_overlap.items():
             if src_rank == target_rank:
                 continue
 
             transfer_bytes = _calculate_volume(list(overlap_key)) * element_size
-            if _is_inter_node(src_rank, target_rank, origin_mesh):
-                inter_bytes += transfer_bytes
-                inter_msgs += 1
-            else:
-                intra_bytes += transfer_bytes
-                intra_msgs += 1
+            total_bytes += transfer_bytes
+            total_msgs += 1
 
         rank_time_s = (
-            (inter_bytes / inter_bw)
-            + (inter_msgs * inter_latency)
-            + (intra_bytes / intra_bw)
-            + (intra_msgs * intra_latency)
+            (total_bytes / bandwidth)
+            + (total_msgs * latency)
         )
         max_rank_time_s = max(max_rank_time_s, rank_time_s)
 

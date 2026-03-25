@@ -102,7 +102,7 @@ def test_enumerate_gemm_step1_layout_plans_respects_fixed_mapping(tmp_path):
                     "A": {
                         "mode": "fixed",
                         "mapping": [
-                            {"shard": ["intra_node"]},
+                            {"shard": ["device"]},
                             "R",
                         ],
                     }
@@ -114,7 +114,7 @@ def test_enumerate_gemm_step1_layout_plans_respects_fixed_mapping(tmp_path):
 
     constraints = load_tensor_mapping_constraints(str(config_path))
     hw_config = load_hardware_config("config/h100.json")
-    mesh = DeviceMesh([0, 1], (1, 2))
+    mesh = DeviceMesh([0, 1], (2,))
 
     ranked_plans = enumerate_gemm_step1_layout_plans(
         problem_shape=(16, 16, 8),
@@ -126,7 +126,7 @@ def test_enumerate_gemm_step1_layout_plans_respects_fixed_mapping(tmp_path):
 
     assert len(ranked_plans) > 0
     assert all(
-        plan.boundary_layouts["A"].shard_specs[0] == ("S", (1,))
+        plan.boundary_layouts["A"].shard_specs[0] == ("S", (0,))
         and plan.boundary_layouts["A"].shard_specs[1] == ("R", ())
         for plan in ranked_plans
     )

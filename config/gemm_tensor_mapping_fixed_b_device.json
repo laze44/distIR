@@ -9,9 +9,9 @@
       "mapping": [
         {
           "shard": [
-            "inter_node"
+            "device"
           ],
-          "shard_factor": 16
+          "shard_factor": 8
         },
         "R"
       ]

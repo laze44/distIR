@@ -9,7 +9,7 @@ from logical sharding.
 Physical topology vs search shapes vs logical shard factors
 -----------------------------------------------------------
 - **Physical topology** is defined by ``TopologySpec`` and describes the
-  actual hardware domains (e.g. ``inter_node=16, intra_node=1``).
+  actual hardware domains (e.g. ``num_devices=16``).
 - **Search enumeration shapes** (e.g. ``(8, 2)``, ``(4, 4)``) are
   factorised mesh shapes produced by ``MeshShapePolicy.enumerate_shapes()``
   to explore the combinatorial tiling space.  They are *not* physical
@@ -18,8 +18,8 @@ Physical topology vs search shapes vs logical shard factors
   per-buffer, per-physical-domain tiling description by mapping each
   search-mesh dimension back to its owning physical domain.
 
-Topology metadata (inter_node_dims / intra_node_dims) is generated at
-shape-construction time rather than post-hoc inferred.
+Topology metadata (device_dims) is generated at shape-construction time
+rather than post-hoc inferred.
 """
 
 import itertools
@@ -119,8 +119,8 @@ class TopologySpec:
     """Ordered list of physical domains defining the device topology.
 
     Domain ordering determines logical mesh dim ordering: domains[0] dims
-    come first, then domains[1], etc.  Default labels for 2-domain case
-    are "inter_node" and "intra_node".
+    come first, then domains[1], etc.  Default label for single-domain case
+    is "device".
     """
 
     domains: List[DomainSpec] = field(default_factory=list)
@@ -128,8 +128,8 @@ class TopologySpec:
 
     def __post_init__(self) -> None:
         if len(self.domain_labels) == 0 and len(self.domains) > 0:
-            if len(self.domains) == 2:
-                self.domain_labels = ["inter_node", "intra_node"]
+            if len(self.domains) == 1:
+                self.domain_labels = ["device"]
             else:
                 self.domain_labels = [f"domain_{i}" for i in range(len(self.domains))]
         if len(self.domain_labels) != len(self.domains):
@@ -214,33 +214,33 @@ def topology_metadata_for_shape(
 ) -> Dict[str, List[int]]:
     """Build topology_metadata dict mapping logical dim indices to domain labels.
 
-    Returns e.g. {"inter_node_dims": [0, 1], "intra_node_dims": [2], "mixed_dims": []}.
+    Returns e.g. {"device_dims": [0, 1], "mixed_dims": []}.
     Generated deterministically from topology — no post-hoc inference.
+
+    Dims are consumed left-to-right.  For each domain with ``size > 1``,
+    a contiguous block of dims whose product equals ``domain.size`` is
+    assigned to that domain.  Domains with ``size == 1`` contribute no dims.
     """
     dim_offset = 0
     label_to_dims: Dict[str, List[int]] = {}
 
     for domain, label in zip(topology.domains, topology.domain_labels):
-        domain_shapes = enumerate_domain_shapes(domain)
-
-        matched = False
-        for factor_tuple in domain_shapes:
-            n_dims = len(factor_tuple)
-            candidate = mesh_shape[dim_offset : dim_offset + n_dims]
-            if candidate == factor_tuple:
-                label_to_dims[label] = list(range(dim_offset, dim_offset + n_dims))
-                dim_offset += n_dims
-                matched = True
-                break
-
-        if not matched:
-            if domain.size == 1:
-                label_to_dims[label] = []
-            else:
-                raise ValueError(
-                    f"Cannot match domain '{label}' (allowed shapes: {domain_shapes}) "
-                    f"at offset {dim_offset} in mesh shape {mesh_shape}"
-                )
+        if domain.size <= 1:
+            label_to_dims[label] = []
+            continue
+        # Consume as many dims as needed to cover this domain's size.
+        product = 1
+        start = dim_offset
+        while product < domain.size and dim_offset < len(mesh_shape):
+            product *= int(mesh_shape[dim_offset])
+            dim_offset += 1
+        if product != domain.size:
+            raise ValueError(
+                f"Cannot match domain '{label}' (size={domain.size}) "
+                f"at offset {start} in mesh shape {mesh_shape}: "
+                f"product of consumed dims is {product}"
+            )
+        label_to_dims[label] = list(range(start, dim_offset))
 
     metadata: Dict[str, List[int]] = {"mixed_dims": []}
     for label, dims in label_to_dims.items():
@@ -249,49 +249,34 @@ def topology_metadata_for_shape(
     return metadata
 
 
-def make_gemm_topology_spec(
-    inter_node: int,
-    intra_node: int,
-    inter_factorization: str = "rank_limited",
-    inter_max_virtual_dims: int = 2,
-    intra_factorization: str = "single_dim",
-    intra_max_virtual_dims: int = 2,
+def make_topology_spec(
+    num_devices: int,
+    factorization: str = "rank_limited",
+    max_virtual_dims: int = 2,
 ) -> TopologySpec:
-    """Create a TopologySpec for the standard GEMM search scenario."""
-    inter_domain = DomainSpec(
+    """Create a TopologySpec for a single-domain clique topology."""
+    domain = DomainSpec(
         kind="clique",
-        size=inter_node,
-        factorization_policy=inter_factorization,
-        max_virtual_dims=inter_max_virtual_dims,
-    )
-    intra_domain = DomainSpec(
-        kind="clique",
-        size=intra_node,
-        factorization_policy=intra_factorization,
-        max_virtual_dims=intra_max_virtual_dims,
+        size=num_devices,
+        factorization_policy=factorization,
+        max_virtual_dims=max_virtual_dims,
     )
     return TopologySpec(
-        domains=[inter_domain, intra_domain],
-        domain_labels=["inter_node", "intra_node"],
+        domains=[domain],
+        domain_labels=["device"],
     )
 
 
-def make_gemm_mesh_shape_policy(
-    inter_node: int,
-    intra_node: int,
-    inter_factorization: str = "rank_limited",
-    inter_max_virtual_dims: int = 2,
-    intra_factorization: str = "single_dim",
-    intra_max_virtual_dims: int = 2,
+def make_mesh_shape_policy(
+    num_devices: int,
+    factorization: str = "rank_limited",
+    max_virtual_dims: int = 2,
 ) -> MeshShapePolicy:
-    """Create a MeshShapePolicy for the standard GEMM search scenario."""
-    topology = make_gemm_topology_spec(
-        inter_node=inter_node,
-        intra_node=intra_node,
-        inter_factorization=inter_factorization,
-        inter_max_virtual_dims=inter_max_virtual_dims,
-        intra_factorization=intra_factorization,
-        intra_max_virtual_dims=intra_max_virtual_dims,
+    """Create a MeshShapePolicy for a single-domain clique topology."""
+    topology = make_topology_spec(
+        num_devices=num_devices,
+        factorization=factorization,
+        max_virtual_dims=max_virtual_dims,
     )
     return MeshShapePolicy(topology=topology)
 
@@ -366,24 +351,21 @@ class FlatMeshShapePolicy(MeshShapePolicy):
         return metadata
 
 
-def make_gemm_flat_mesh_shape_policy(
-    inter_node: int,
-    intra_node: int,
+def make_flat_mesh_shape_policy(
+    num_devices: int,
 ) -> FlatMeshShapePolicy:
-    """Create a flat MeshShapePolicy where each domain is a 1-D clique.
+    """Create a flat MeshShapePolicy where the domain is a 1-D clique.
 
-    Unlike ``make_gemm_mesh_shape_policy``, this forces both domains to
-    use ``single_dim`` factorisation so that
-    ``enumerate_shapes()`` only returns flat shapes (e.g. ``(16,)``
-    instead of ``(8, 2)`` and ``(4, 4)``).  The search engine then
-    uses ``_enumerate_logical_factor_assignments()`` to explore the
-    full factor space independently per axis.
+    Unlike ``make_mesh_shape_policy``, this forces the domain to use
+    ``single_dim`` factorisation so that ``enumerate_shapes()`` only
+    returns flat shapes (e.g. ``(16,)`` instead of ``(8, 2)`` and
+    ``(4, 4)``).  The search engine then uses
+    ``_enumerate_logical_factor_assignments()`` to explore the full
+    factor space independently per axis.
     """
-    topology = make_gemm_topology_spec(
-        inter_node=inter_node,
-        intra_node=intra_node,
-        inter_factorization="single_dim",
-        intra_factorization="single_dim",
+    topology = make_topology_spec(
+        num_devices=num_devices,
+        factorization="single_dim",
     )
     return FlatMeshShapePolicy(topology=topology)
 
@@ -397,14 +379,14 @@ def make_gemm_flat_mesh_shape_policy(
 class LogicalShardFactors:
     """Per-physical-domain shard factors for a single buffer.
 
-    ``domain_factors`` maps a domain label (e.g. ``"inter_node"``) to
+    ``domain_factors`` maps a domain label (e.g. ``"device"``) to
     a tuple of per-tensor-dimension shard factors contributed by that
     domain.  Unsharded tensor dimensions are omitted (factor == 1).
 
     Example: for matrix ``A`` with shape ``[M, K]`` under search mesh
-    ``(8, 2)`` where both dims belong to ``inter_node``, and the buffer
+    ``(8, 2)`` where both dims belong to ``device``, and the buffer
     is sharded ``S(0)`` on dim 0 and ``S(1)`` on dim 1, the logical
-    factors would be ``{"inter_node": (8, 2)}``, meaning the inter-node
+    factors would be ``{"device": (8, 2)}``, meaning the device
     domain contributes a factor of 8 along dim 0 and 2 along dim 1.
     """
 
@@ -421,7 +403,7 @@ class LogicalShardFactors:
         return result
 
     def to_summary(self) -> str:
-        """Human-readable format, e.g. ``inter_node=(2, 8)``."""
+        """Human-readable format, e.g. ``device=(2, 8)``."""
         if not self.domain_factors:
             return "replicated"
         parts = []

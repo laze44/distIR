@@ -126,20 +126,11 @@ def _infer_gemm_problem_shape(program: Program) -> Tuple[int, int, int]:
 
 
 def _fixed_topology_metadata(mesh_shape: Tuple[int, ...]) -> Dict[str, List[int]]:
-    # TODO: migrate to MeshShapePolicy (mercury/search/topology_policy.py)
     if len(mesh_shape) == 0:
         raise ValueError("mesh_shape must be non-empty")
-    if len(mesh_shape) == 1:
-        return {
-            "inter_node_dims": [],
-            "intra_node_dims": [0],
-            "mixed_dims": [],
-        }
+    device_dims = [dim for dim in range(len(mesh_shape)) if int(mesh_shape[dim]) > 1]
     return {
-        "inter_node_dims": [0] if int(mesh_shape[0]) > 1 else [],
-        "intra_node_dims": [
-            dim for dim in range(1, len(mesh_shape)) if int(mesh_shape[dim]) > 1
-        ],
+        "device_dims": device_dims,
         "mixed_dims": [],
     }
 
@@ -150,17 +141,11 @@ def _flexible_dim_options(
     options: List[Optional[Tuple[int, ...]]] = [None]
     seen = {None}
 
-    inter_dims = tuple(int(dim) for dim in topology_metadata.get("inter_node_dims", []))
-    intra_dims = tuple(int(dim) for dim in topology_metadata.get("intra_node_dims", []))
-    mixed_dims = tuple(int(dim) for dim in topology_metadata.get("mixed_dims", []))
-    combined_dims = tuple(sorted(set(inter_dims + intra_dims)))
+    device_dims = tuple(int(dim) for dim in topology_metadata.get("device_dims", []))
 
-    for dims in (inter_dims, intra_dims, combined_dims, mixed_dims):
-        normalized = tuple(sorted(set(int(dim) for dim in dims)))
-        if len(normalized) == 0 or normalized in seen:
-            continue
-        options.append(normalized)
-        seen.add(normalized)
+    if len(device_dims) > 0 and device_dims not in seen:
+        options.append(device_dims)
+        seen.add(device_dims)
     return options
 
 
@@ -254,28 +239,19 @@ def _dim_uses_topology(
 
 
 def _bytes_to_comm_ms(
-    inter_bytes: float,
-    intra_bytes: float,
+    total_bytes: float,
     hw_config: Dict[str, Any],
 ) -> float:
-    inter_bw = _read_positive(
-        hw_config, ["interconnect", "inter_node", "bandwidth_gb_per_s"]
+    bw = _read_positive(
+        hw_config, ["interconnect", "bandwidth_gb_per_s"]
     ) * (10**9)
-    intra_bw = _read_positive(
-        hw_config, ["interconnect", "intra_node", "bandwidth_gb_per_s"]
-    ) * (10**9)
-    inter_latency = _read_non_negative(
-        hw_config, ["interconnect", "inter_node", "latency_us"]
-    ) / (10**6)
-    intra_latency = _read_non_negative(
-        hw_config, ["interconnect", "intra_node", "latency_us"]
+    latency = _read_non_negative(
+        hw_config, ["interconnect", "latency_us"]
     ) / (10**6)
 
     return (
-        (inter_bytes / inter_bw)
-        + (intra_bytes / intra_bw)
-        + (inter_latency if inter_bytes > 0 else 0.0)
-        + (intra_latency if intra_bytes > 0 else 0.0)
+        (total_bytes / bw)
+        + (latency if total_bytes > 0 else 0.0)
     ) * 1000.0
 
 
@@ -286,14 +262,9 @@ def _classify_obligation_bytes(
     layout_b: LogicalBoundaryLayoutSignature,
     dim_b: int,
     topology_metadata: Dict[str, List[int]],
-) -> Tuple[float, float]:
-    inter_dims = topology_metadata.get("inter_node_dims", [])
-    uses_inter = _dim_uses_topology(layout_a, dim_a, inter_dims) or _dim_uses_topology(
-        layout_b, dim_b, inter_dims
-    )
-    if uses_inter:
-        return bytes_moved, 0.0
-    return 0.0, bytes_moved
+) -> float:
+    """Return total bytes moved (all on single device link)."""
+    return bytes_moved
 
 
 def _estimate_step1_cost(
@@ -336,12 +307,11 @@ def _estimate_step1_cost(
     compute_ms = (flops / (peak_tflops * (10**12))) * 1000.0
 
     input_materialization_bytes = 0.0
-    input_inter_bytes = 0.0
-    input_intra_bytes = 0.0
+    input_comm_bytes = 0.0
     if layout_a.shard_specs[0] != layout_c.shard_specs[0]:
         moved = a_total_bytes * 0.5
         input_materialization_bytes += moved
-        inter_bytes, intra_bytes = _classify_obligation_bytes(
+        input_comm_bytes += _classify_obligation_bytes(
             moved,
             layout_a,
             0,
@@ -349,12 +319,10 @@ def _estimate_step1_cost(
             0,
             topology_metadata,
         )
-        input_inter_bytes += inter_bytes
-        input_intra_bytes += intra_bytes
     if layout_b.shard_specs[1] != layout_c.shard_specs[1]:
         moved = b_total_bytes * 0.5
         input_materialization_bytes += moved
-        inter_bytes, intra_bytes = _classify_obligation_bytes(
+        input_comm_bytes += _classify_obligation_bytes(
             moved,
             layout_b,
             1,
@@ -362,8 +330,6 @@ def _estimate_step1_cost(
             1,
             topology_metadata,
         )
-        input_inter_bytes += inter_bytes
-        input_intra_bytes += intra_bytes
 
     reduction_shard_cards = max(
         _mesh_cards(layout_a.mesh_shape, layout_a.shard_specs[1][1])
@@ -374,13 +340,12 @@ def _estimate_step1_cost(
         else 1,
     )
     reduction_finalize_bytes = 0.0
-    reduction_inter_bytes = 0.0
-    reduction_intra_bytes = 0.0
+    reduction_comm_bytes = 0.0
     if reduction_shard_cards > 1:
         reduction_finalize_bytes = c_total_bytes * (
             float(reduction_shard_cards - 1) / float(reduction_shard_cards)
         )
-        inter_bytes, intra_bytes = _classify_obligation_bytes(
+        reduction_comm_bytes += _classify_obligation_bytes(
             reduction_finalize_bytes,
             layout_a,
             1,
@@ -388,29 +353,18 @@ def _estimate_step1_cost(
             0,
             topology_metadata,
         )
-        reduction_inter_bytes += inter_bytes
-        reduction_intra_bytes += intra_bytes
 
     output_materialization_bytes = 0.0
-    output_inter_bytes = 0.0
-    output_intra_bytes = 0.0
+    output_comm_bytes = 0.0
     if layout_c.shard_specs[0][0] == "R" or layout_c.shard_specs[1][0] == "R":
         output_materialization_bytes = c_total_bytes * 0.25
-        if _dim_uses_topology(
-            layout_c, 0, topology_metadata.get("inter_node_dims", [])
-        ) or _dim_uses_topology(
-            layout_c, 1, topology_metadata.get("inter_node_dims", [])
-        ):
-            output_inter_bytes = output_materialization_bytes
-        else:
-            output_intra_bytes = output_materialization_bytes
+        output_comm_bytes = output_materialization_bytes
 
     overlapable_comm_ms = _bytes_to_comm_ms(
-        input_inter_bytes, input_intra_bytes, hw_config
+        input_comm_bytes, hw_config
     )
     blocking_comm_ms = _bytes_to_comm_ms(
-        reduction_inter_bytes + output_inter_bytes,
-        reduction_intra_bytes + output_intra_bytes,
+        reduction_comm_bytes + output_comm_bytes,
         hw_config,
     )
     edge_ms = 0.0

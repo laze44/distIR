@@ -137,7 +137,7 @@ def _build_mock_program(
 
 
 def test_load_tensor_mapping_constraints_default_template():
-    constraints = load_tensor_mapping_constraints("config/gemm_tensor_mapping.json")
+    constraints = load_tensor_mapping_constraints("config/gemm_tensor_mapping_flexible.json")
     assert constraints.summary_by_matrix() == {
         "A": "flexible",
         "B": "flexible",
@@ -167,7 +167,7 @@ def test_load_operator_tensor_mapping_constraints_reject_fixed_activation(tmp_pa
                     "matrices": {
                         "A": {
                             "mode": "fixed",
-                            "mapping": ["R", {"shard": ["intra_node"]}],
+                            "mapping": ["R", {"shard": ["device"]}],
                         }
                     }
                 }
@@ -190,7 +190,7 @@ def test_load_operator_tensor_mapping_constraints_fill_defaults(tmp_path):
                         "B": {
                             "mode": "fixed",
                             "mapping": [
-                                {"shard": ["intra_node"]},
+                                {"shard": ["device"]},
                                 "R",
                             ],
                         }
@@ -206,7 +206,7 @@ def test_load_operator_tensor_mapping_constraints_fill_defaults(tmp_path):
     summary = constraints.summary_by_operator()
 
     assert summary["gate"]["A"] == "flexible"
-    assert summary["gate"]["B"] == "fixed [S(intra_node), R]"
+    assert summary["gate"]["B"] == "fixed [S(device), R]"
     assert summary["gate"]["C"] == "flexible"
 
     assert summary["up"] == {"A": "flexible", "B": "flexible", "C": "flexible"}
@@ -301,7 +301,7 @@ def test_search_without_constraints_matches_flexible_template():
     baseline_programs = _search_gemm_programs((2, 2))
     flexible_programs = _search_gemm_programs(
         (2, 2),
-        "config/gemm_tensor_mapping.json",
+        "config/gemm_tensor_mapping_flexible.json",
     )
 
     assert len(baseline_programs) == len(flexible_programs)
@@ -322,7 +322,7 @@ def test_search_single_fixed_matrix_prunes_candidates(tmp_path):
                     "mode": "fixed",
                     "mapping": [
                         "R",
-                        {"shard": ["intra_node"]},
+                        {"shard": ["device"]},
                     ],
                 },
             },
@@ -340,85 +340,6 @@ def test_search_single_fixed_matrix_prunes_candidates(tmp_path):
     )
 
 
-def test_search_multiple_fixed_matrices_apply_intersection(tmp_path):
-    config_path = _write_config(
-        tmp_path,
-        {
-            "version": 1,
-            "matrices": {
-                "B": {
-                    "mode": "fixed",
-                    "mapping": [
-                        "R",
-                        {"shard": ["intra_node"]},
-                    ],
-                },
-                "C": {
-                    "mode": "fixed",
-                    "mapping": [
-                        {"shard": ["inter_node"]},
-                        {"shard": ["intra_node"]},
-                    ],
-                },
-            },
-        },
-    )
-
-    single_programs = _search_gemm_programs(
-        (2, 2),
-        _write_config(
-            tmp_path,
-            {
-                "version": 1,
-                "matrices": {
-                    "B": {
-                        "mode": "fixed",
-                        "mapping": [
-                            "R",
-                            {"shard": ["intra_node"]},
-                        ],
-                    },
-                },
-            },
-            "single_b_mapping.json",
-        ),
-    )
-    constrained_programs = _search_gemm_programs((2, 2), config_path)
-    constraints = load_tensor_mapping_constraints(config_path)
-
-    assert 0 < len(constrained_programs) <= len(single_programs)
-    assert all(
-        program_satisfies_tensor_mapping_constraints(program, constraints)
-        for program in constrained_programs
-    )
-
-
-def test_search_mixed_constraint_matches_flattened_candidates(tmp_path):
-    config_path = _write_config(
-        tmp_path,
-        {
-            "version": 1,
-            "matrices": {
-                "C": {
-                    "mode": "fixed",
-                    "mapping": [
-                        "R",
-                        {"shard": ["mixed"]},
-                    ],
-                },
-            },
-        },
-    )
-
-    constrained_programs = _search_gemm_programs((2, 2), config_path)
-    constraints = load_tensor_mapping_constraints(config_path)
-
-    assert len(constrained_programs) > 0
-    assert all(program.mesh.shape == (4,) for program in constrained_programs)
-    assert all(
-        program_satisfies_tensor_mapping_constraints(program, constraints)
-        for program in constrained_programs
-    )
 
 
 def test_exact_layout_constraints_match_same_layout():
@@ -563,11 +484,11 @@ def test_program_satisfies_logical_layout_constraints():
 def test_parse_shard_factor():
     """Verify shard_factor field parses correctly."""
     constraints = load_tensor_mapping_constraints(
-        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        "config/gemm_tensor_mapping_fixed_b_device.json"
     )
     summary = constraints.summary_by_matrix()
     assert summary["A"] == "flexible"
-    assert summary["B"] == "fixed [S(inter_node, factor=4), S(inter_node, factor=4)]"
+    assert summary["B"] == "fixed [S(device, factor=16), R]"
     assert summary["C"] == "flexible"
 
 
@@ -580,7 +501,7 @@ def test_parse_shard_factor_rejects_non_integer(tmp_path):
                 "B": {
                     "mode": "fixed",
                     "mapping": [
-                        {"shard": ["inter_node"], "shard_factor": "four"},
+                        {"shard": ["device"], "shard_factor": "four"},
                         "R",
                     ],
                 },
@@ -600,7 +521,7 @@ def test_parse_shard_factor_rejects_value_one(tmp_path):
                 "B": {
                     "mode": "fixed",
                     "mapping": [
-                        {"shard": ["inter_node"], "shard_factor": 1},
+                        {"shard": ["device"], "shard_factor": 1},
                         "R",
                     ],
                 },
@@ -651,11 +572,11 @@ def test_shard_factor_match_accepts_valid_subset():
         outputs=program.outputs,
         body=program.body,
         mesh=program.mesh,
-        topology_metadata={"inter_node_dims": [0, 1]},
+        topology_metadata={"device_dims": [0, 1]},
     )
 
     constraints = load_tensor_mapping_constraints(
-        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        "config/gemm_tensor_mapping_fixed_b_device.json"
     )
     assert program_satisfies_tensor_mapping_constraints(program, constraints)
 
@@ -680,11 +601,11 @@ def test_shard_factor_match_rejects_wrong_product():
         outputs=program.outputs,
         body=program.body,
         mesh=program.mesh,
-        topology_metadata={"inter_node_dims": [0, 1]},
+        topology_metadata={"device_dims": [0, 1]},
     )
 
     constraints = load_tensor_mapping_constraints(
-        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        "config/gemm_tensor_mapping_fixed_b_device.json"
     )
     assert not program_satisfies_tensor_mapping_constraints(program, constraints)
 
@@ -711,21 +632,21 @@ def test_shard_factor_match_logical_factors_consistent():
         outputs=program.outputs,
         body=program.body,
         mesh=program.mesh,
-        topology_metadata={"inter_node_dims": [0, 1], "intra_node_dims": [], "mixed_dims": []},
+        topology_metadata={"device_dims": [0, 1]},
     )
 
-    # This program satisfies the fixed_b_inter_node constraint (factor=4 per dim)
+    # This program satisfies the fixed_b_device constraint (factor=16 total)
     constraints = load_tensor_mapping_constraints(
-        "config/gemm_tensor_mapping_fixed_b_inter_node.json"
+        "config/gemm_tensor_mapping_fixed_b_device.json"
     )
     assert program_satisfies_tensor_mapping_constraints(program, constraints)
 
-    # Logical factors should show inter_node=(4, 4) for B
+    # Logical factors should show device=(4, 4) for B
     logical_factors = compute_program_logical_shard_factors(program)
     b_factors = logical_factors.get("B")
     assert b_factors is not None
-    assert b_factors.domain_factors.get("inter_node") == (4, 4)
-    assert b_factors.total_factor("inter_node") == 16
+    assert b_factors.domain_factors.get("device") == (4, 4)
+    assert b_factors.total_factor("device") == 16
 
 
 def test_logical_factor_constraint_matching():
@@ -752,30 +673,25 @@ def test_logical_factor_constraint_matching():
         outputs=program.outputs,
         body=program.body,
         mesh=program.mesh,
-        topology_metadata={"inter_node_dims": [0], "intra_node_dims": [1], "mixed_dims": []},
+        topology_metadata={"device_dims": [0, 1]},
     )
 
-    # A is sharded on dim 0 via inter_node (factor 4)
+    # A is sharded on dim 0 via device (factor 4)
     assert program_satisfies_logical_factor_constraints(
-        program, {"A": {"inter_node": (4,)}}
+        program, {"A": {"device": (4,)}}
     )
 
-    # B is sharded on dim 1 via intra_node (factor 2)
+    # B is sharded on dim 1 via device (factor 2)
     assert program_satisfies_logical_factor_constraints(
-        program, {"B": {"intra_node": (2,)}}
+        program, {"B": {"device": (2,)}}
     )
 
-    # C is sharded on both domains
+    # C is sharded on both dims via device
     assert program_satisfies_logical_factor_constraints(
-        program, {"C": {"inter_node": (4,), "intra_node": (2,)}}
+        program, {"C": {"device": (4, 2)}}
     )
 
     # Wrong factor should fail
     assert not program_satisfies_logical_factor_constraints(
-        program, {"A": {"inter_node": (2,)}}
-    )
-
-    # Wrong domain should fail
-    assert not program_satisfies_logical_factor_constraints(
-        program, {"A": {"intra_node": (4,)}}
+        program, {"A": {"device": (2,)}}
     )

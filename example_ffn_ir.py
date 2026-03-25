@@ -148,8 +148,7 @@ def search_ffn(
     seq_len: int,
     d_model: int,
     d_ffn: int,
-    inter_node: int,
-    intra_node: int,
+    num_devices: int,
     output_dir: str,
     top_k: int,
     layout_top_k: int,
@@ -160,16 +159,16 @@ def search_ffn(
     """Run FFN search and save the best two-step result plus top-k candidates."""
     if batch <= 0 or seq_len <= 0 or d_model <= 0 or d_ffn <= 0:
         raise ValueError("batch/seq_len/d_model/d_ffn must be positive integers")
-    if inter_node <= 0 or intra_node <= 0:
-        raise ValueError("inter_node and intra_node must be positive integers")
+    if num_devices <= 0:
+        raise ValueError("num_devices must be a positive integer")
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
     if layout_top_k <= 0:
         raise ValueError("layout_top_k must be a positive integer")
 
     m_len = batch * seq_len
-    world_size = inter_node * intra_node
-    mesh = DeviceMesh(list(range(world_size)), (inter_node, intra_node))
+    world_size = num_devices
+    mesh = DeviceMesh(list(range(world_size)), (world_size,))
 
     templates = _load_ffn_templates()
     operator_sources = {
@@ -228,7 +227,7 @@ def search_ffn(
         output_dir,
         (
             f"ffn_b{batch}_l{seq_len}_dm{d_model}_df{d_ffn}_"
-            f"inter{inter_node}_intra{intra_node}"
+            f"devices{num_devices}"
         ),
     )
     os.makedirs(result_dir, exist_ok=True)
@@ -254,7 +253,7 @@ def search_ffn(
     summary_lines = [
         "FFN Two-Step Search Results",
         f"Input: batch={batch}, seq_len={seq_len}, d_model={d_model}, d_ffn={d_ffn}",
-        f"Mesh: inter_node={inter_node}, intra_node={intra_node}, world_size={world_size}",
+        f"Mesh: num_devices={num_devices}, world_size={world_size}",
         f"Hardware config: {hw_config['name']}",
         f"Mapping config: {mapping_config_path}",
         f"Requested top_k per operator: {top_k}",
@@ -523,7 +522,7 @@ def search_ffn(
     print(
         "FFN search completed: "
         f"batch={batch}, seq_len={seq_len}, d_model={d_model}, d_ffn={d_ffn}, "
-        f"inter_node={inter_node}, intra_node={intra_node}, "
+        f"num_devices={num_devices}, "
         f"top_k={top_k}, layout_top_k={layout_top_k}"
     )
     print(f"Results saved to: {result_dir}/")
@@ -540,16 +539,10 @@ def main() -> None:
     parser.add_argument("--d-model", type=int, default=4096, help="Model hidden dim (default: 256)")
     parser.add_argument("--d-ffn", type=int, default=4096, help="FFN hidden dim (default: 1024)")
     parser.add_argument(
-        "--inter-node",
-        type=int,
-        default=1,
-        help="Inter-node mesh dimension (default: 1)",
-    )
-    parser.add_argument(
-        "--intra-node",
+        "--num-devices",
         type=int,
         default=4,
-        help="Intra-node mesh dimension (default: 2)",
+        help="Number of devices (default: 4)",
     )
     parser.add_argument(
         "--output-dir",
@@ -593,8 +586,7 @@ def main() -> None:
         seq_len=args.seq_len,
         d_model=args.d_model,
         d_ffn=args.d_ffn,
-        inter_node=args.inter_node,
-        intra_node=args.intra_node,
+        num_devices=args.num_devices,
         output_dir=args.output_dir,
         top_k=args.top_k,
         layout_top_k=args.layout_top_k,

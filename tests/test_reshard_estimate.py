@@ -35,7 +35,7 @@ def _build_buffer(
 
 def test_estimate_reshard_same_layout_zero():
     hw = load_hardware_config("config/h100.json")
-    origin_mesh = DeviceMesh(list(range(4)), (2, 2))
+    origin_mesh = DeviceMesh(list(range(4)), (4,))
 
     src = _build_buffer(
         "src",
@@ -53,8 +53,10 @@ def test_estimate_reshard_same_layout_zero():
     assert estimate_reshard_time(src, dst, hw, origin_mesh) == 0.0
 
 
-def test_estimate_reshard_inter_node_larger_than_intra_node():
+def test_estimate_reshard_different_shard_dim_nonzero():
     hw = load_hardware_config("config/h100.json")
+    origin_mesh = DeviceMesh(list(range(4)), (4,))
+
     src = _build_buffer(
         "src",
         mesh_shape=(2, 2),
@@ -68,18 +70,13 @@ def test_estimate_reshard_inter_node_larger_than_intra_node():
         specs=[(ShardType.SHARD, [1]), ShardType.REPLICATE],
     )
 
-    inter_origin = DeviceMesh(list(range(4)), (2, 2))
-    intra_origin = DeviceMesh(list(range(4)), (1, 4))
-
-    inter_cost = estimate_reshard_time(src, dst, hw, inter_origin)
-    intra_cost = estimate_reshard_time(src, dst, hw, intra_origin)
-
-    assert inter_cost > intra_cost
+    cost = estimate_reshard_time(src, dst, hw, origin_mesh)
+    assert cost > 0.0
 
 
 def test_estimate_reshard_partial_replicated_to_sharded_is_finite_non_zero():
     hw = load_hardware_config("config/h100.json")
-    origin_mesh = DeviceMesh(list(range(4)), (2, 2))
+    origin_mesh = DeviceMesh(list(range(4)), (4,))
 
     src = _build_buffer(
         "src",
@@ -101,7 +98,7 @@ def test_estimate_reshard_partial_replicated_to_sharded_is_finite_non_zero():
 
 def test_estimate_reshard_different_mesh_shapes_same_world_size():
     hw = load_hardware_config("config/h100.json")
-    origin_mesh = DeviceMesh(list(range(4)), (2, 2))
+    origin_mesh = DeviceMesh(list(range(4)), (4,))
 
     src = _build_buffer(
         "src",

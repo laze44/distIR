@@ -2,7 +2,6 @@
 
 import copy
 import itertools
-from collections import defaultdict
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from tqdm import tqdm
 
@@ -45,51 +44,15 @@ def _linear_to_coords(rank: int, shape: Tuple[int, ...]) -> Tuple[int, ...]:
 def _infer_topology_metadata(
     origin_mesh: DeviceMesh, mesh: DeviceMesh
 ) -> Dict[str, List[int]]:
-    """Infer inter/intra-node mesh dimensions after reshaping."""
+    """Infer device mesh dimensions after reshaping.
+
+    In a single-domain topology, all mesh dimensions belong to the
+    device domain.
+    """
     ndim = len(mesh.shape)
-    if len(origin_mesh.shape) <= 1:
-        return {
-            "inter_node_dims": [],
-            "intra_node_dims": list(range(ndim)),
-            "mixed_dims": [],
-        }
-
-    inter_node_dims: List[int] = []
-    intra_node_dims: List[int] = []
-    mixed_dims: List[int] = []
-
-    for dim in range(ndim):
-        groups: Dict[Tuple[int, ...], List[Tuple[int, ...]]] = defaultdict(list)
-        for coords in itertools.product(*[range(v) for v in mesh.shape]):
-            key = tuple(coords[idx] for idx in range(ndim) if idx != dim)
-            groups[key].append(coords)
-
-        inter_changes = False
-        intra_changes = False
-        for grouped_coords in groups.values():
-            inter_vals = set()
-            intra_vals = set()
-            for coords in grouped_coords:
-                rank = mesh.get_device(coords)
-                origin_coords = _linear_to_coords(rank, origin_mesh.shape)
-                inter_vals.add(origin_coords[0])
-                intra_vals.add(origin_coords[1:])
-            inter_changes = inter_changes or len(inter_vals) > 1
-            intra_changes = intra_changes or len(intra_vals) > 1
-
-        if inter_changes and not intra_changes:
-            inter_node_dims.append(dim)
-        elif intra_changes and not inter_changes:
-            intra_node_dims.append(dim)
-        elif inter_changes and intra_changes:
-            mixed_dims.append(dim)
-        else:
-            intra_node_dims.append(dim)
-
     return {
-        "inter_node_dims": inter_node_dims,
-        "intra_node_dims": intra_node_dims,
-        "mixed_dims": mixed_dims,
+        "device_dims": list(range(ndim)),
+        "mixed_dims": [],
     }
 
 
